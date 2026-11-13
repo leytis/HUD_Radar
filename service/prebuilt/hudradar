@@ -1,0 +1,1081 @@
+#!/usr/bin/node
+// Собрано service/build.js из service/src. Правьте исходники, не этот файл.
+// cluster_render_client.js: MPL-2.0, (C) 2026 Robert Nisipeanu, https://github.com/robertnisipeanu/idrive-apps
+'use strict';
+const __BUNDLE = {
+    files: {"hs-cap.py":"#!/var/opt/mgu-python/current/bin/python3\n\"\"\"\nhs-cap.py - читает из видеопамяти две маленькие области плитки HUD Speed на дашборде CarPlay\nи пишет их в stdout для службы hudradar. Только читает: композитор и экран не трогает.\n\nЗапись в stdout (little-endian):\n  16 байт заголовка: b'HSF1', номер, время этой проверки в десятых долях мс, флаги (0 - кадр с данными, 1 - без изменений, 2 - экран не найден,\n  3 - кадр не удалось прочитать целиком, композитор его перерисовывал)\n  при флаге 0 следом идут пиксели BGRA: заголовок плитки (TITLE), затем полоса с предупреждением (BAND)\n\n  python3 hs-cap.py [период_мс=100]\n\nКаждый период читается только маленькая область PROBE (около 2 мс). Плитка целиком читается, когда PROBE\nизменилась, и отправляется после того, как два чтения подряд совпали: кадр, пойманный посреди смены, не уходит.\n\"\"\"\nimport ctypes, fcntl, mmap, os, struct, sys, time\nfrom operator import sub\n\ndef _ioc(d, nr, size): return (d << 30) | (size << 16) | (0x64 << 8) | nr\ndef IOWR(nr, size): return _ioc(3, nr, size)\ndef IOW(nr, size): return _ioc(1, nr, size)\n\nGETRESOURCES = IOWR(0xA0, 64)\nGETCRTC = IOWR(0xA1, 104)\nGETPLANERES = IOWR(0xB5, 16)\nGETPLANE = IOWR(0xB6, 32)\nGETFB = IOWR(0xAD, 28)\nSET_CLIENT_CAP = IOW(0x0D, 16)\nGEM_CLOSE = IOW(0x09, 8)\nI915_MMAP_GTT = IOWR(0x64, 16)\n\nSCREEN = (1920, 720)\nTILE_X, TILE_Y = 1316, 482                 # плитка на экране\nTITLE = (112, 26, 100, 32)                 # x, y, w, h внутри плитки: буквы \"D Speed\"\nBAND = (60, 96, 488, 100)                  # значки, точки, дистанция\nPROBE = (380, 116, 168, 56)                # дистанция и значок GPS: по этой области видно, что плитка изменилась\nPERIOD = (int(sys.argv[1]) if len(sys.argv) > 1 else 100) / 1000.0\nFULL_EVERY = 2.0                           # с, как часто перечитывать плитку целиком, даже если PROBE не менялась\nSETTLE = 0.04                              # с между двумя чтениями, которые должны совпасть\n\nout = sys.stdout.buffer\ndef log(s):\n    sys.stderr.write('cap: ' + s + '\\n'); sys.stderr.flush()\n\ndef io(fd, req, buf):\n    fcntl.ioctl(fd, req, buf, True)\n    return buf\n\ndef plane_ids(fd):\n    b = bytearray(16); io(fd, GETPLANERES, b)\n    n = struct.unpack_from('I', b, 8)[0]\n    arr = (ctypes.c_uint32 * max(n, 1))()\n    b = bytearray(16)\n    struct.pack_into('Q', b, 0, ctypes.addressof(arr)); struct.pack_into('I', b, 8, n)\n    io(fd, GETPLANERES, b)\n    return list(arr)[:n]\n\ndef plane_fb(fd, pid):\n    p = bytearray(32); struct.pack_into('I', p, 0, pid)\n    io(fd, GETPLANE, p)\n    return struct.unpack_from('I', p, 8)[0]\n\nclass Fb(object):\n    \"\"\"One read of a framebuffer: a handle and a mapping, both released on close.\"\"\"\n    def __init__(self, fd, fb):\n        f = bytearray(28); struct.pack_into('I', f, 0, fb)\n        io(fd, GETFB, f)\n        _, self.w, self.h, self.pitch, self.bpp, _, self.handle = struct.unpack_from('IIIIIII', f, 0)\n        self.fd = fd; self.m = None\n        if not self.handle:\n            raise OSError('no handle for fb %d' % fb)\n        try:\n            if (self.w, self.h) != SCREEN or self.bpp != 32:\n                raise OSError('fb %d is %dx%d/%d' % (fb, self.w, self.h, self.bpp))\n            g = bytearray(16); struct.pack_into('I', g, 0, self.handle)\n            io(fd, I915_MMAP_GTT, g)\n            off = struct.unpack_from('Q', g, 8)[0]\n            self.m = mmap.mmap(fd, (self.pitch * self.h + 4095) & ~4095, mmap.MAP_SHARED, mmap.PROT_READ, offset=off)\n        except Exception:\n            self.close(); raise\n    def region(self, r):\n        x, y, w, h = r\n        m, p = self.m, self.pitch\n        x0 = (TILE_X + x) * 4; n = w * 4\n        return b''.join([m[(TILE_Y + y + i) * p + x0:(TILE_Y + y + i) * p + x0 + n] for i in range(h)])\n    def close(self):\n        if self.m is not None:\n            try: self.m.close()\n            except Exception: pass\n            self.m = None\n        if self.handle:\n            try: io(self.fd, GEM_CLOSE, bytearray(struct.pack('II', self.handle, 0)))\n            except OSError: pass\n            self.handle = 0\n\nclass Maps(object):\n    \"\"\"The framebuffers' mappings, each kept for a short while: the compositor swaps between the same few buffers.\"\"\"\n    TTL = 2.0\n    def __init__(self, fd):\n        self.fd = fd; self.maps = {}\n    def get(self, fb):\n        now = time.time()\n        e = self.maps.get(fb)\n        if e and now - e[1] < self.TTL: return e[0]\n        if e: e[0].close(); del self.maps[fb]\n        for k in [k for k, v in self.maps.items() if now - v[1] >= self.TTL]:\n            self.maps[k][0].close(); del self.maps[k]\n        f = Fb(self.fd, fb)\n        self.maps[fb] = (f, now)\n        return f\n    def clear(self):\n        for v in self.maps.values(): v[0].close()\n        self.maps = {}\n\ndef changed(a, b, step=5, need=5):\n    \"\"\"\n    Two reads differ by more than the video stream's noise (CarPlay is a video: every frame differs a little).\n    Fine enough to tell a digit half way through its cross-fade from the finished one: only one digit of the\n    distance changes between 500 and 400, and it must not be sent, or kept, half faded.\n    \"\"\"\n    if b is None or len(a) != len(b): return True\n    n = 0\n    for d in map(sub, a[0::step], b[0::step]):\n        if d > 26 or d < -26:\n            n += 1\n            if n >= need: return True\n    return False\n\ndef has_picture(data):\n    \"\"\"Not an all-black buffer (the primary plane under the HMI's is black).\"\"\"\n    return any(data[i] or data[i + 1] or data[i + 2] for i in range(0, len(data), 404))\n\ndef find_plane(fd):\n    \"\"\"The plane whose framebuffer is the 1920x720 picture of the centre display (the highest such plane with content).\"\"\"\n    for pid in sorted(plane_ids(fd), reverse=True):\n        try:\n            fb = plane_fb(fd, pid)\n            if not fb: continue\n            f = Fb(fd, fb)\n            try:\n                if has_picture(f.region(BAND)) or has_picture(f.region(TITLE)): return pid\n            finally:\n                f.close()\n        except OSError:\n            continue\n    return 0\n\ndef main():\n    fd = os.open('/dev/dri/card0', os.O_RDWR | os.O_CLOEXEC)\n    try: io(fd, SET_CLIENT_CAP, bytearray(struct.pack('QQ', 2, 1)))\n    except OSError as e: log('universal planes: %s' % e)\n    maps = Maps(fd)\n    st = {'torn': 0}\n\n    def read(regions, plane):\n        \"\"\"The regions from the buffer on screen, or None when it was redrawn under every try. 0 when the plane has no buffer.\"\"\"\n        for attempt in range(3):\n            fb = plane_fb(fd, plane)\n            if not fb: return 0\n            f = maps.get(fb)\n            data = b''.join([f.region(r) for r in regions])\n            if plane_fb(fd, plane) == fb: return data       # the buffer stayed on screen while it was read\n            st['torn'] += 1\n        return None\n\n    plane = 0; seq = 0; last_sent = None; last_probe = None; last_full = 0.0; black = 0\n    t_read = 0.0; n_read = 0; t_stat = time.time(); sent = 0; fulls = 0; slow = 0\n    log('hs-cap started, check every %d ms' % (PERIOD * 1000))\n    while True:\n        t0 = time.time()\n        flags = 1; data = b''\n        try:\n            if not plane:\n                maps.clear()\n                plane = find_plane(fd)\n                if plane: log('plane %d' % plane)\n                last_probe = None\n            if not plane:\n                flags = 2\n            else:\n                probe = read([PROBE], plane)\n                if probe == 0:\n                    plane = 0; maps.clear(); flags = 2\n                elif probe is None:\n                    flags = 3\n                elif changed(probe, last_probe, 5, 3) or t0 - last_full >= FULL_EVERY:\n                    # the tile whole, once two reads in a row agree\n                    a = read([TITLE, BAND], plane); stable = False\n                    for attempt in range(10):\n                        if not a: break\n                        time.sleep(SETTLE)\n                        b = read([TITLE, BAND], plane)\n                        if b and not changed(b, a): a = b; stable = True; break\n                        a = b\n                    fulls += 1\n                    if a == 0:\n                        plane = 0; maps.clear(); flags = 2\n                    elif not stable:\n                        flags = 3; last_probe = None             # still changing: look again next time\n                    else:\n                        last_full = time.time(); last_probe = probe\n                        black = 0 if has_picture(a) else black + 1\n                        if black > 8: plane = 0; black = 0       # this plane went black: look again\n                        if changed(a, last_sent): last_sent = a; data = a; flags = 0; sent += 1\n        except OSError as e:\n            log('read: %s' % e); plane = 0; maps.clear(); flags = 2\n        if flags == 2: last_sent = None\n        seq += 1\n        try:\n            out.write(struct.pack('<4sIII', b'HSF1', seq, int((time.time() - t0) * 10000), flags))\n            if flags == 0: out.write(data)\n            out.flush()\n        except (BrokenPipeError, OSError):\n            break                                                  # the service is gone\n        dt = time.time() - t0\n        t_read += dt; n_read += 1\n        if time.time() - t_stat > 60:\n            avg = t_read / n_read * 1000\n            log('avg %.1f ms per check, %d whole-tile reads, %d redrawn-while-read retries, %d changed frames in the last minute' % (avg, fulls, st['torn'], sent))\n            slow = slow + 1 if avg > 50 else 0\n            if slow >= 2:\n                log('checks are too slow for two minutes: stopping, so the head unit is not loaded'); sys.exit(3)\n            t_read = 0.0; n_read = 0; st['torn'] = 0; sent = 0; fulls = 0; t_stat = time.time()\n        time.sleep(max(0.02, PERIOD - dt))\n\nif __name__ == '__main__':\n    try:\n        main()\n    except KeyboardInterrupt:\n        pass\n","title-mask.b64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAQEBAQEBAQEBAQEBAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAQEBAQEBAAAAAAEBAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAEBAQEBAAAAAAAAAQEBAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAABAQEBAAAAAAAAAAABAQEBAAAAAAABAQEBAAAAAAEBAQEAAAAAAAAAAAAAAAAAAQEBAQEBAAAAAAAAAAAAAAAAAAEBAQEBAQAAAAAAAAAAAAAAAAEBAQEBAAAAAQEBAQAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAQEBAQEBAQEAAAAAAAAAAAABAQEBAQEBAQEBAAAAAAAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAQEBAQEBAQEAAAEBAQEAAAAAAAEBAQEBAAAAAAAAAAAAAAAAAAAAAAEBAQEAAQEBAQEBAQEBAQAAAAAAAAABAQEBAQEBAQEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAAAAAAAAAQEBAQEBAQEBAQABAQEBAAAAAAABAQEBAQEAAAAAAAAAAAAAAAAAAAABAQEBAQEBAQEBAQEBAQEBAAAAAAABAQEBAQEAAAEBAQEBAAAAAAAAAQEBAQEBAAABAQEBAQAAAAAAAAEBAQEBAQEBAQEBAQEBAQAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAAAAAQEBAQEBAAAAAAABAQEBAQAAAAAAAQEBAQAAAAAAAQEBAQEAAAAAAAEBAQEAAAAAAAEBAQEBAAAAAAEBAQEBAQAAAAABAQEBAQEAAAAAAAABAQEBAQEBAQEBAQEBAAAAAAAAAAEBAQEBAAAAAAAAAQEBAQEAAAAAAQEBAQEAAAAAAAABAQEBAAAAAAEBAQEAAAAAAAAAAQEBAQAAAAABAQEBAQAAAAAAAAEBAQEBAAAAAAAAAAEBAQEBAQEBAQEBAQEAAAAAAAABAQEBAQAAAAAAAAABAQEBAAAAAAEBAQEAAAAAAAAAAQEBAQEAAAABAQEBAAAAAAAAAAEBAQEBAAAAAQEBAQAAAAAAAAAAAQEBAQAAAAAAAAAAAAABAQEBAQEBAQEBAQAAAAAAAQEBAQEAAAAAAAAAAQEBAQEAAAABAQEBAQEBAQEBAQEBAQEBAAAAAQEBAQEBAQEBAQEBAQEBAQAAAAEBAQEAAAAAAAAAAAEBAQEAAAAAAAAAAAAAAAAAAAEBAQEBAQEBAAAAAAEBAQEAAAAAAAAAAAEBAQEBAAAAAQEBAQEBAQEBAQEBAQEBAQAAAAEBAQEBAQEBAQEBAQEBAQEAAAABAQEBAAAAAAAAAAABAQEBAAAAAAAAAAAAAAAAAAAAAAABAQEBAQAAAAABAQEBAAAAAAAAAAABAQEBAQAAAAEBAQEBAQEBAQEBAQEBAQEAAAABAQEBAQEBAQEBAQEBAQEBAAAAAQEBAQAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAQEBAQEAAAAAAQEBAQEAAAAAAAAAAQEBAQEAAAABAQEBAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAAEBAQEAAAAAAQEBAQAAAAAAAAAAAAEBAQEBAAAAAAEBAQEBAAAAAAAAAAEBAQEAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAAEBAQEBAAAAAAEBAQEBAAAAAAAAAAABAQEBAQAAAAABAQEBAQAAAAAAAAEBAQEBAAAAAAEBAQEBAAAAAAAAAAAAAAAAAAABAQEBAQAAAAAAAAAAAAAAAAAAAQEBAQEAAAAAAAABAQEBAQAAAAAAAQEBAQEAAAAAAAABAQEBAQAAAAAAAQEBAQEBAAAAAAEBAQEBAQAAAAAAAQEBAQAAAAAAAAEBAQEAAAAAAAEBAQEAAAAAAAABAQEBAAAAAAEBAQEBAQAAAAABAQEBAQEAAAAAAAEBAQEBAQEBAQEBAQEBAQEAAAAAAAEBAQEBAQEBAQEBAQEBAQAAAAAAAAEBAQEBAQEBAQEBAQEBAAAAAAABAQEBAQEBAQEBAQEBAQAAAAAAAQEBAQEBAQEBAQEBAQEBAAAAAAAAAQEBAQEBAQEBAQEBAQEAAAAAAAABAQEBAAEBAQEBAQEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAAAAAAAAAAEBAQEBAQEBAQEBAQAAAAAAAAABAQEBAQEBAQEAAQEBAQAAAAAAAAABAQEBAQEBAQEBAQEAAAAAAAAAAQEBAQAAAQEBAQEBAQEAAAAAAAAAAAABAQEBAQEBAQEBAAAAAAAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAAEBAQEBAQEAAAEBAQEAAAAAAAAAAAAAAQEBAQEBAAAAAAAAAAAAAAEBAQEAAAAAAAEBAAAAAAAAAAAAAAAAAAAAAQEBAAAAAAAAAAAAAAAAAAAAAAEBAQAAAAAAAAAAAAAAAAAAAAEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+    clusterRender: function () { const module = { exports: {} }; (function (module, exports) {
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 Robert Nisipeanu
+/**
+ * Node 8 client for the cluster render service (../PROTOCOL.md): an app's
+ * layers on the instrument cluster and the HUD. Copy this file into an app's
+ * src/ and bundle it like any other module; it needs only the `net` and
+ * `events` builtins.
+ *
+ *   const { ClusterRender } = require('./cluster_render_client.js');
+ *   const cr = new ClusterRender('robertn_myapp');
+ *   const badge = cr.image({ target: 'panel', klass: 'overlay', x: 1700, y: 40, w: 160, h: 64, iw: 160, ih: 64 });
+ *   cr.on('layer', (ref, state, reason) => { ... });   // shown, waiting, suspended, stalled, hidden, error
+ *   cr.on('target', (name, state, holder, reason, guideDisabled, disabled) => { ... });
+ *   cr.on('budget', (capKb, maxKb, reason) => { ... });
+ *   cr.on('ready', () => cr.pixels(badge, null, rgba));   // after every (re)connect
+ *   cr.connect();
+ *   ...
+ *   cr.pixels(badge, [{ x: 0, y: 0, w: 40, h: 64 }], changedRows);   // only what changed
+ *   cr.set(badge, { visible: false, rotate: 15 });
+ *
+ *   const font = cr.asset({ target: 'panel', format: 'r8', w: 256, h: 128 });
+ *   cr.pixels(font, null, glyphs);
+ *   const label = cr.effect({ target: 'panel', x: 40, y: 600, w: 300, h: 60, fs: GLYPH_FS, time: true });
+ *   cr.bind(label, 'u_atlas', font);
+ *   cr.uniform(label, 'u_cells', cells, { type: 'vec4' });
+ *   const car = cr.mesh({ target: 'panel', x: 700, y: 200, w: 520, h: 400, cz: 6 });
+ *   cr.part(car, 1, { vs: LIT_VS, fs: LIT_FS });
+ *   cr.geometry(car, 1, { positions, normals, indices });
+ *   cr.animate(car, { part: 1, property: 'rotate', keys: '0:0,0,0 4000:0,360,0', loop: true });
+ *   cr.close();
+ *
+ * Nothing blocks and nothing queues without bound. The client reconnects
+ * whenever the service goes, makes every asset and layer again with its last
+ * settings: uniforms, mesh parts with their geometry and transforms, binds
+ * and animations, and sends each image layer and asset whole; 'ready' then
+ * asks the app for anything else. An image layer or asset is kept here
+ * whole: what changed since it last went is sent as one update when the
+ * socket takes it. A video frame not yet sent is replaced by the next
+ * (newest wins).
+ */
+'use strict';
+
+const net = require('net');
+const EventEmitter = require('events');
+
+const DEFAULT_PATH = '/dev/shm/cluster-render/render.sock';
+const PROTO = 1;
+const JSON_T = 0x4a;    /* 'J' */
+const FRAME_T = 0x46;   /* 'F' */
+const MESH_T = 0x4d;    /* 'M' */
+const MAX_DIRTY = 16;
+const BACKOFF_MS = [250, 500, 1000, 2000];
+const SET_KEYS = ['klass', 'z', 'x', 'y', 'w', 'h', 'visible', 'exclusive', 'prewarm', 'contend', 'guide_hold',
+    'opacity', 'rotate', 'sx', 'sy', 'px', 'py'];
+const MESH_KEYS = ['projection', 'fov', 'ortho_h', 'near', 'far', 'cx', 'cy', 'cz', 'crx', 'cry', 'crz'];
+const UNIFORM_WIDTH = { float: 1, vec2: 2, vec3: 3, vec4: 4, mat4: 16 };
+
+function message(type, body) {
+    const m = Buffer.alloc(5 + body.length);
+    m.writeUInt32LE(body.length + 1, 0);
+    m[4] = type;
+    body.copy(m, 5);
+    return m;
+}
+
+function jsonMessage(obj) {
+    return message(JSON_T, Buffer.from(JSON.stringify(obj), 'utf8'));
+}
+
+/* A frame message: u32 ref, u64 id, u16 rect count, rects, pixels. */
+function frameMessage(ref, id, rects, pixels) {
+    const head = 14 + rects.length * 8;
+    const body = Buffer.alloc(head + pixels.length);
+    body.writeUInt32LE(ref >>> 0, 0);
+    body.writeUInt32LE(id % 0x100000000, 4);
+    body.writeUInt32LE(Math.floor(id / 0x100000000), 8);
+    body.writeUInt16LE(rects.length, 12);
+    rects.forEach((r, i) => {
+        body.writeUInt16LE(r.x, 14 + i * 8);
+        body.writeUInt16LE(r.y, 16 + i * 8);
+        body.writeUInt16LE(r.w, 18 + i * 8);
+        body.writeUInt16LE(r.h, 20 + i * 8);
+    });
+    pixels.copy(body, head);
+    return message(FRAME_T, body);
+}
+
+/* A mesh message: u32 ref, part, vertices, indices, u8 mask, then the
+ * float32 arrays and the u16 indices. */
+function meshMessage(ref, part, g) {
+    const v = g.positions.length / 3;
+    const arrays = [g.positions, g.normals, g.texcoords, g.colors].filter((a) => a && a.length);
+    const floats = arrays.reduce((n, a) => n + a.length, 0);
+    const body = Buffer.alloc(17 + floats * 4 + g.indices.length * 2);
+    body.writeUInt32LE(ref >>> 0, 0);
+    body.writeUInt32LE(part >>> 0, 4);
+    body.writeUInt32LE(v, 8);
+    body.writeUInt32LE(g.indices.length, 12);
+    body[16] = (g.normals && g.normals.length ? 1 : 0) | (g.texcoords && g.texcoords.length ? 2 : 0) |
+        (g.colors && g.colors.length ? 4 : 0);
+    let off = 17;
+    arrays.forEach((a) => { for (let i = 0; i < a.length; i++, off += 4) body.writeFloatLE(a[i], off); });
+    for (let i = 0; i < g.indices.length; i++, off += 2) body.writeUInt16LE(g.indices[i], off);
+    return message(MESH_T, body);
+}
+
+function flag(v) { return v ? 1 : 0; }
+
+class ClusterRender extends EventEmitter {
+    constructor(app, socketPath) {
+        super();
+        this.app = app;
+        this.path = socketPath || DEFAULT_PATH;
+        this.sock = null;
+        this.ready = false;
+        this.closed = true;
+        this.backoff = 0;
+        this.timer = null;
+        this.layers = new Map();     /* ref -> { kind, opts, uniforms, parts, binds, anims, image, dirty, whole } */
+        this.nextRef = 1;
+        this.pendingFrames = new Map();   /* ref -> frame message waiting for the socket */
+        this.blocked = false;
+        this.inbuf = Buffer.alloc(0);
+        this.backend = '';
+        this.targets = '';
+    }
+
+    connect() {
+        this.closed = false;
+        this._open();
+    }
+
+    close() {
+        this.closed = true;
+        if (this.timer) clearTimeout(this.timer);
+        this.timer = null;
+        if (this.sock) this.sock.destroy();
+        this.sock = null;
+        this.ready = false;
+    }
+
+    _open() {
+        if (this.closed || this.sock) return;
+        const sock = net.connect(this.path);
+        this.sock = sock;
+        this.blocked = false;
+        this.connected = false;
+        this.inbuf = Buffer.alloc(0);
+        sock.on('connect', () => {
+            /* Everything made before now goes in the replay below. */
+            this.connected = true;
+            this._send({ op: 'hello', app: this.app, proto: PROTO });
+            /* Assets first, so binds find them; binds and animations once
+             * every layer and part is made. */
+            [true, false].forEach((assets) => this.layers.forEach((l, ref) => {
+                if ((l.kind === 'asset') !== assets) return;
+                this._send(this._layerMsg(ref, l));
+                l.parts.forEach((p) => {
+                    this._send(p.msg);
+                    if (p.geometry) this._write(p.geometry);
+                    if (p.transform) this._send(p.transform);
+                });
+                Object.keys(l.uniforms).forEach((k) => this._send(l.uniforms[k]));
+                if ((l.kind === 'image' || l.kind === 'asset') && l.have) { l.whole = true; l.dirty = []; l.dirtyBytes = 0; }
+            }));
+            this.layers.forEach((l) => Object.keys(l.binds).forEach((k) => this._send(l.binds[k].msg)));
+            this.layers.forEach((l) => l.anims.forEach((m) => this._send(m)));
+        });
+        /* A socket close() let go is not this.sock any more: its late events
+         * are ignored. */
+        sock.on('data', (d) => { if (this.sock === sock) this._data(d); });
+        sock.on('drain', () => { if (this.sock === sock) { this.blocked = false; this._pump(); } });
+        sock.on('error', () => {});
+        sock.on('close', () => {
+            if (this.sock !== sock) return;
+            const wasReady = this.ready;
+            this.sock = null;
+            this.ready = false;
+            this.connected = false;
+            this.pendingFrames.clear();
+            if (wasReady) this.emit('disconnected');
+            if (this.closed) return;
+            const ms = BACKOFF_MS[Math.min(this.backoff, BACKOFF_MS.length - 1)];
+            this.backoff++;
+            this.timer = setTimeout(() => { this.timer = null; this._open(); }, ms);
+        });
+    }
+
+    _data(d) {
+        this.inbuf = this.inbuf.length ? Buffer.concat([this.inbuf, d]) : d;
+        let off = 0;
+        while (this.inbuf.length - off >= 5) {
+            const len = this.inbuf.readUInt32LE(off);
+            if (len < 1 || len > 8 * 1024 * 1024) { this.sock.destroy(); return; }
+            if (this.inbuf.length - off < 4 + len) break;
+            const type = this.inbuf[off + 4];
+            const body = this.inbuf.slice(off + 5, off + 4 + len);
+            off += 4 + len;
+            if (type !== JSON_T) continue;
+            let ev;
+            try { ev = JSON.parse(body.toString('utf8')); } catch (e) { continue; }
+            this._event(ev);
+        }
+        this.inbuf = this.inbuf.slice(off);
+    }
+
+    _event(ev) {
+        if (ev.ev === 'hello') {
+            this.backend = ev.backend;
+            this.targets = ev.targets;
+            this.ready = true;
+            this.backoff = 0;
+            this._pump();
+            this.emit('ready');
+        } else if (ev.ev === 'layer') {
+            this.emit('layer', ev.ref, ev.state, ev.reason);
+        } else if (ev.ev === 'target') {
+            this.emit('target', ev.target, ev.state, ev.holder, ev.reason, ev.guide_disabled === 1, ev.disabled === 1);
+        } else if (ev.ev === 'budget') {
+            this.emit('budget', ev.cap_kb_per_s, ev.max_kb_per_s, ev.reason);
+        } else if (ev.ev === 'error') {
+            this.emit('refused', ev.op, ev.ref, ev.reason);
+        } else if (ev.ev === 'status') {
+            this.emit('status', ev.text);
+        }
+    }
+
+    _send(obj) { this._write(jsonMessage(obj)); }
+
+    _write(m) {
+        if (!this.sock || !this.connected) return;
+        if (!this.sock.write(m)) this.blocked = true;
+    }
+
+    /* Writes frames while the socket takes them: image changes first, then
+     * the newest video frame of each layer. */
+    _pump() {
+        if (!this.sock || !this.ready) return;
+        this.layers.forEach((l, ref) => {
+            if (this.blocked || (l.kind !== 'image' && l.kind !== 'asset') || !(l.whole || l.dirty.length)) return;
+            const rects = l.whole ? [] : l.dirty;
+            let px;
+            if (l.whole) {
+                px = l.image;
+            } else {
+                const parts = [];
+                rects.forEach((r) => {
+                    for (let y = 0; y < r.h; y++) {
+                        const start = ((r.y + y) * l.iw + r.x) * l.bpp;
+                        parts.push(l.image.slice(start, start + r.w * l.bpp));
+                    }
+                });
+                px = Buffer.concat(parts);
+            }
+            l.whole = false;
+            l.dirty = [];
+            l.dirtyBytes = 0;
+            if (!this.sock.write(frameMessage(ref, 0, rects, px))) this.blocked = true;
+        });
+        for (const ref of Array.from(this.pendingFrames.keys())) {
+            if (this.blocked) break;
+            const m = this.pendingFrames.get(ref);
+            this.pendingFrames.delete(ref);
+            if (!this.sock.write(m)) this.blocked = true;
+        }
+    }
+
+    _layerMsg(ref, l) {
+        const o = l.opts;
+        if (l.kind === 'asset') {
+            return { op: 'asset', ref: ref, target: o.target, format: o.format || 'rgba8', w: o.w, h: o.h,
+                sampling: o.sampling || 'nearest', wrap: o.wrap || 'clamp' };
+        }
+        const m = { op: 'layer', ref: ref, target: o.target, kind: l.kind };
+        this._setFields(m, o);
+        if (l.kind === 'video') {
+            ['vw', 'vh', 'fps', 'level_bits', 'dirty_threshold', 'settle_ms', 'stall_ms'].forEach((k) => {
+                if (o[k] !== undefined) m[k] = o[k];
+            });
+            if (o.pan_blocks !== undefined) m.pan_blocks = flag(o.pan_blocks);
+        } else if (l.kind === 'image') {
+            m.iw = o.iw;
+            m.ih = o.ih;
+            if (o.fps !== undefined) m.fps = o.fps;
+            if (o.sampling) m.sampling = o.sampling;
+        } else if (l.kind === 'mesh') {
+            MESH_KEYS.forEach((k) => { if (o[k] !== undefined) m[k] = o[k]; });
+        } else {
+            m.fs = o.fs;
+            if (o.vs) m.vs = o.vs;
+            if (o.time_fps !== undefined) m.time_fps = o.time_fps;
+            if (o.time) m.time = 1;
+        }
+        return m;
+    }
+
+    _setFields(m, o) {
+        SET_KEYS.forEach((k) => {
+            if (o[k] === undefined) return;
+            const key = k === 'klass' ? 'class' : k;
+            m[key] = typeof o[k] === 'boolean' ? flag(o[k]) : o[k];
+        });
+    }
+
+    _uniformMsg(ref, name, v) {
+        return { op: 'uniform', ref: ref, name: name, v: v.join(' ') };
+    }
+
+    _add(kind, opts) {
+        const o = Object.assign({}, opts);
+        const l = { kind: kind, opts: o, uniforms: {}, parts: new Map(), binds: {}, anims: new Map(), nextAnim: 1,
+            dirty: [], dirtyBytes: 0, whole: false, have: false };
+        if (kind === 'image') {
+            o.iw = o.iw || o.w;
+            o.ih = o.ih || o.h;
+            if (!(o.iw > 0 && o.ih > 0 && o.iw <= 1920 && o.ih <= 720)) return 0;
+            l.iw = o.iw;
+            l.ih = o.ih;
+            l.bpp = 4;
+        } else if (kind === 'asset') {
+            l.bpp = o.format === 'r8' ? 1 : 4;
+            if (!(o.w > 0 && o.h > 0 && o.w <= 2048 && o.h <= 2048 && o.w * o.h * l.bpp <= 1920 * 720 * 4)) return 0;
+            l.iw = o.w;
+            l.ih = o.h;
+        }
+        if (l.bpp) l.image = Buffer.alloc(l.iw * l.ih * l.bpp);
+        const ref = this.nextRef++;
+        this.layers.set(ref, l);
+        if (this.sock) this._send(this._layerMsg(ref, l));
+        return ref;
+    }
+
+    /* opts: target, klass, z, x, y, w, h, visible, exclusive, prewarm,
+     * contend, guide_hold, opacity, rotate, sx, sy, px, py, then per kind (see
+     * PROTOCOL.md); an image's iw and ih default to its w and h; an
+     * effect's time: true takes u_time from the renderer's clock. A mesh's:
+     * projection, fov, ortho_h, near, far and its camera cx, cy, cz, crx,
+     * cry, crz (degrees, right-handed). Returns the layer's ref, 0 when
+     * refused. */
+    video(opts) { return this._add('video', opts); }
+    image(opts) { return this._add('image', opts); }
+    effect(opts) { return this._add('effect', opts); }
+    mesh(opts) { return this._add('mesh', opts); }
+    /* opts: target, format ('rgba8', 'r8'), w, h (up to 2048), sampling
+     * ('nearest', 'bilinear'), wrap ('clamp', 'repeat'). */
+    asset(opts) { return this._add('asset', opts); }
+
+    set(ref, opts) {
+        const l = this.layers.get(ref);
+        if (!l || l.kind === 'asset') return;
+        const keys = l.kind === 'mesh' ? SET_KEYS.concat(MESH_KEYS) : SET_KEYS;
+        keys.forEach((k) => { if (opts[k] !== undefined) l.opts[k] = opts[k]; });
+        const m = { op: 'set', ref: ref };
+        this._setFields(m, opts);
+        if (l.kind === 'mesh') MESH_KEYS.forEach((k) => { if (opts[k] !== undefined) m[k] = opts[k]; });
+        this._send(m);
+    }
+
+    /* values: 1-4 numbers; or, with opts.type ('float', 'vec2', 'vec3',
+     * 'vec4', 'mat4'), whole elements of it, up to 1024 numbers: an array
+     * uniform. opts.part: a mesh layer's part. */
+    uniform(ref, name, values, opts) {
+        const l = this.layers.get(ref);
+        const o = opts || {};
+        if (!l || !values.length) return;
+        const m = this._uniformMsg(ref, name, values);
+        if (o.type) {
+            const w = UNIFORM_WIDTH[o.type];
+            if ((l.kind !== 'effect' && l.kind !== 'mesh') || !w || values.length > 1024 || values.length % w) return;
+            m.type = o.type;
+        } else if ((l.kind !== 'effect' && l.kind !== 'mesh') || values.length > 4) return;
+        if (o.part) m.part = o.part;
+        l.uniforms[(o.part || 0) + ':' + name] = m;
+        this._send(m);
+    }
+
+    /* The effect layer's (or mesh part's) sampler samples the asset. */
+    bind(ref, sampler, asset, part) {
+        const l = this.layers.get(ref), a = this.layers.get(asset);
+        if (!l || !a || a.kind !== 'asset') return;
+        const m = { op: 'bind', ref: ref, sampler: sampler, asset: asset };
+        if (part) m.part = part;
+        l.binds[(part || 0) + ':' + sampler] = { asset: asset, msg: m };
+        this._send(m);
+    }
+
+    /* A mesh layer's part, numbered from 1: opts vs, fs, depth, cull
+     * ('back', 'front', 'none'), blend ('alpha', 'add', 'none'). */
+    part(ref, part, opts) {
+        const l = this.layers.get(ref);
+        if (!l || l.kind !== 'mesh' || !(part > 0) || l.parts.has(part)) return false;
+        const m = { op: 'part', ref: ref, part: part, vs: opts.vs, fs: opts.fs };
+        if (opts.depth !== undefined) m.depth = flag(opts.depth);
+        if (opts.cull) m.cull = opts.cull;
+        if (opts.blend) m.blend = opts.blend;
+        l.parts.set(part, { msg: m, geometry: null, transform: null });
+        this._send(m);
+        return true;
+    }
+
+    /* g: positions (xyz), normals (xyz), texcoords (uv), colors (rgba) per
+     * vertex, the last three optional, and indices (triangles). The service
+     * takes a part's new geometry at most once a second. */
+    geometry(ref, part, g) {
+        const l = this.layers.get(ref);
+        const p = l && l.parts.get(part);
+        const v = g.positions.length / 3;
+        const per = (a, n) => !a || !a.length || a.length === v * n;
+        if (!p || !(v >= 1 && v <= 65535 && Number.isInteger(v)) || !per(g.normals, 3) || !per(g.texcoords, 2) ||
+            !per(g.colors, 4) || !(g.indices.length >= 3 && g.indices.length % 3 === 0 && g.indices.length <= 196605)) {
+            return false;
+        }
+        for (let i = 0; i < g.indices.length; i++) if (!(g.indices[i] < v)) return false;
+        p.geometry = meshMessage(ref, part, g);
+        this._write(p.geometry);
+        return true;
+    }
+
+    /* t: tx, ty, tz, rx, ry, rz (degrees, right-handed), sx, sy, sz.
+     * False, and nothing sent, when a value is out of the service's range. */
+    transform(ref, part, t) {
+        const l = this.layers.get(ref);
+        const p = l && l.parts.get(part);
+        if (!p) return false;
+        const keys = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'].filter((k) => t[k] !== undefined);
+        if (!keys.every((k) => typeof t[k] === 'number' && Math.abs(t[k]) <= (k[0] === 'r' ? 36000 : 1000000)))
+            return false;
+        /* The service merges each transform into the part's pose, so the
+         * replay carries every field set so far. */
+        p.transform = p.transform || { op: 'transform', ref: ref, part: part };
+        keys.forEach((k) => { p.transform[k] = t[k]; });
+        this._send(p.transform);
+        return true;
+    }
+
+    /* opts: part, property ('rotate', 'translate', 'scale', 'uniform'),
+     * name (the uniform's), keys ("t:v[,v,v] ..." or [[t, v...], ...], t in
+     * ms), loop, interp ('linear', 'step'). Returns the animation's number,
+     * 0 when refused here. */
+    animate(ref, opts) {
+        const l = this.layers.get(ref);
+        if (!l || !opts.property || !opts.keys) return 0;
+        const keys = typeof opts.keys === 'string' ? opts.keys
+            : opts.keys.map((k) => k[0] + ':' + k.slice(1).join(',')).join(' ');
+        const anim = l.nextAnim++;
+        const m = { op: 'animate', ref: ref, anim: anim, property: opts.property, keys: keys,
+            loop: flag(opts.loop), interp: opts.interp || 'linear' };
+        if (opts.part) m.part = opts.part;
+        if (opts.name) m.name = opts.name;
+        l.anims.set(anim, m);
+        this._send(m);
+        return anim;
+    }
+
+    stop(ref, anim) {
+        const l = this.layers.get(ref);
+        if (!l || !l.anims.delete(anim)) return;
+        this._send({ op: 'stop', ref: ref, anim: anim });
+    }
+
+    /* A layer or an asset; an asset a layer samples stays (the service
+     * refuses it). */
+    drop(ref) {
+        if (!this.layers.has(ref)) return;
+        let sampled = false;
+        this.layers.forEach((l) => Object.keys(l.binds).forEach((k) => { sampled = sampled || l.binds[k].asset === ref; }));
+        if (!sampled) this.layers.delete(ref);
+        this.pendingFrames.delete(ref);
+        this._send({ op: 'drop', ref: ref });
+    }
+
+    frameBytes(ref) {
+        const l = this.layers.get(ref);
+        if (!l) return 0;
+        if (l.kind === 'video') {
+            const w = l.opts.vw || 1088, h = l.opts.vh || 480;
+            return w * (h + (h >> 1));
+        }
+        return l.image ? l.image.length : 0;
+    }
+
+    /* A video frame: the whole 4:2:0 atlas. False while not connected. */
+    frame(ref, atlas, id) {
+        const l = this.layers.get(ref);
+        if (!this.ready || !l || l.kind !== 'video' || atlas.length !== this.frameBytes(ref)) return false;
+        this.pendingFrames.set(ref, frameMessage(ref, id || 0, [], atlas));
+        this._pump();
+        return true;
+    }
+
+    /* An image or asset update: rects ([{x, y, w, h}]) with their rows
+     * packed one rect after another in px, or no rects (null) and the whole
+     * image. */
+    pixels(ref, rects, px) {
+        const l = this.layers.get(ref);
+        if (!l || !l.image) return false;
+        const iw = l.iw, ih = l.ih, bpp = l.bpp;
+        if (!rects || !rects.length) {
+            if (px.length !== l.image.length) return false;
+            px.copy(l.image);
+            l.whole = true;
+            l.dirty = [];
+            l.dirtyBytes = 0;
+        } else {
+            let need = 0;
+            for (const r of rects) {
+                if (!(r.w > 0 && r.h > 0 && r.x >= 0 && r.y >= 0 && r.x + r.w <= iw && r.y + r.h <= ih)) return false;
+                need += r.w * r.h * bpp;
+            }
+            if (need !== px.length) return false;
+            let off = 0;
+            for (const r of rects) {
+                for (let y = 0; y < r.h; y++) {
+                    px.copy(l.image, ((r.y + y) * iw + r.x) * bpp, off, off + r.w * bpp);
+                    off += r.w * bpp;
+                }
+                if (l.whole) continue;
+                /* An update of rects (8 bytes of header each) never outgrows
+                 * the whole image, which is within the service's message
+                 * limit. */
+                l.dirtyBytes += r.w * r.h * bpp;
+                if (l.dirty.length >= MAX_DIRTY || l.dirtyBytes + 8 * (l.dirty.length + 1) >= l.image.length) {
+                    l.whole = true;
+                    l.dirty = [];
+                    l.dirtyBytes = 0;
+                } else l.dirty.push(r);
+            }
+        }
+        l.have = true;
+        this._pump();
+        return true;
+    }
+
+    status() { this._send({ op: 'status' }); }
+}
+
+module.exports = { ClusterRender, DEFAULT_PATH };
+
+    })(module, module.exports); return module.exports; },
+};
+(function () {
+'use strict';
+/*
+ * hudradar - служба: предупреждения приложения HUD Speed с дашборда CarPlay на проекции BMW (iDrive 7, MGU).
+ *
+ * Как устроено:
+ *   hs-cap.py читает из видеопамяти плитку HUD Speed (только чтение, композитор не участвует);
+ *   эта программа решает, есть ли на плитке предупреждение, вырезает значок, лимит и дистанцию, убирает тёмный
+ *   фон и отправляет картинку в проекцию через cluster-render (инструмент из MGU Store).
+ *   Цифры не распознаются: картинка переносится как есть. База камер остаётся в приложении HUD Speed.
+ *
+ * Управление (приложение Radar HUD):
+ *   /dev/shm/hudradar/control.json   настройки от приложения: { mode, show, size, pos, bright, demo }
+ *   /dev/shm/hudradar/status.json    что служба делает сейчас, раз в секунду
+ *   <state>/config.json              последние настройки: с ними служба стартует, пока приложение не запущено
+ *
+ * Режимы: auto - место в проекции занято, пока на экране CarPlay; on - всегда; off - служба ничего не показывает
+ * и экран не читает.
+ *
+ * Служба никогда не завершается сама: её перезапускает systemd, а частые перезапуски он считает сбоем.
+ * Node 8. В репозитории это исходник; в Store ставится один файл, собранный service/build.js.
+ */
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const VERSION = '1.0.0';
+
+/* ---------- ресурсы: в собранном файле они внутри него, при запуске из исходников лежат рядом ---------- */
+/* global __BUNDLE */
+const bundled = typeof __BUNDLE !== 'undefined';
+function resource(name) { return bundled ? __BUNDLE.files[name] : fs.readFileSync(path.join(__dirname, name), 'utf8'); }
+function clusterRenderClient() { return bundled ? __BUNDLE.clusterRender() : require('./cluster_render_client.js'); }
+
+const SHM = process.env.HR_SHM || '/dev/shm/hudradar';
+const STATE = process.env.HR_STATE || '/var/opt/hudradar/state';
+const RUN = process.env.HR_RUN || process.env.RUNTIME_DIRECTORY || '/run/hudradar';
+const PYTHON = process.env.HR_PYTHON || '/var/opt/mgu-python/current/bin/python3';
+const CR_SOCKET = process.env.HR_CR_SOCKET || '/dev/shm/cluster-render/render.sock';
+
+/* ---------- геометрия (в точках плитки 600x236, плитка на экране в 1316,482) ---------- */
+const TITLE = { x: 112, y: 26, w: 100, h: 32 };
+const BAND = { x: 60, y: 96, w: 488, h: 100 };
+const TITLE_BYTES = TITLE.w * TITLE.h * 4, BAND_BYTES = BAND.w * BAND.h * 4;
+// внутри полосы BAND:
+const R_TEAL = { x: 424, y: 20, w: 41, h: 56 };     // значок GPS: он есть, пока предупреждения нет
+const R_DIST = { x: 320, y: 30, w: 168, h: 38 };    // дистанция
+const R_ICON1 = { x: 10, y: 5, w: 91, h: 90 };      // первый значок
+const SRC_LEFT = { x: 2, w: 236 };                  // значки и точки
+const SRC_ICON = { x: 2, w: 104 };                  // только первый значок
+const SRC_RIGHT = { x: 330, w: 158 };               // дистанция
+const OUT_W = 400, OUT_H = BAND.h, GAP = 16;
+const SCENE_W = 800, CENTRE_Y = 222;                // сцена проекции 800x480; здесь середина картинки при pos 0
+
+const HOLD_MS = 4000;          // плитка закрыта окном BMW: столько держим последнее предупреждение
+const STALE_MS = 150000;       // одно и то же предупреждение дольше этого не показываем
+const ON_MS = 200;             // предупреждение должно продержаться на плитке столько, прежде чем попадёт на стекло
+const OFF_MS = 1500;           // и столько плитка должна быть пустой, прежде чем оно уйдёт
+const DEMO_MS = 8000;
+
+function log(s) { process.stdout.write(s + '\n'); }
+
+/* ---------- что на плитке ---------- */
+function count(buf, bw, r, pred) {
+    let n = 0;
+    for (let y = r.y; y < r.y + r.h; y++) for (let x = r.x; x < r.x + r.w; x++) {
+        const i = (y * bw + x) * 4;
+        if (pred(buf[i + 2], buf[i + 1], buf[i])) n++;
+    }
+    return n;
+}
+const isWhite = (r, g, b) => r > 200 && g > 200 && b > 200;
+const isTeal = (r, g, b) => g > 170 && b > 140 && r < 90;
+
+/** The title's letters as a bit mask (1 = a light pixel). Mid-grey threshold: steady under the video's noise. */
+function titleMask(title) {
+    const m = Buffer.alloc(TITLE.w * TITLE.h);
+    for (let i = 0; i < m.length; i++) m[i] = (title[i * 4 + 2] + title[i * 4 + 1] + title[i * 4] > 420) ? 1 : 0;
+    return m;
+}
+function maskMatch(a, b) {
+    let both = 0, any = 0;
+    for (let i = 0; i < a.length; i++) { if (a[i] && b[i]) both++; if (a[i] || b[i]) any++; }
+    return any ? both / any : 0;
+}
+/** How many pixels of two bands differ by more than the video's noise. One changed digit is a few hundred. */
+function bandDiff(a, b) {
+    let n = 0;
+    for (let i = 0; i < a.length; i += 4) {
+        const d0 = a[i] - b[i], d1 = a[i + 1] - b[i + 1], d2 = a[i + 2] - b[i + 2];
+        if (d0 > 30 || d0 < -30 || d1 > 30 || d1 < -30 || d2 > 30 || d2 < -30) n++;
+    }
+    return n;
+}
+/**
+ * What the tile shows: 'idle' (HUD Speed's logo and the GPS mark), 'alert' (a warning with its distance),
+ * or 'unknown' (another screen, a BMW window over the tile, a frame caught mid-change).
+ */
+function classify(title, band, refMask) {
+    const tm = maskMatch(titleMask(title), refMask);
+    const teal = count(band, BAND.w, R_TEAL, isTeal);
+    const dist = count(band, BAND.w, R_DIST, isWhite);
+    const icon = count(band, BAND.w, R_ICON1, isWhite);
+    const info = { title: Math.round(tm * 100) / 100, teal: teal, dist: dist, icon: icon, leftOk: icon >= 3500 };
+    if (tm < 0.55) info.state = 'unknown';
+    else if (teal >= 400) info.state = 'idle';
+    else if (teal < 60 && dist >= 250) info.state = 'alert';
+    else info.state = 'unknown';
+    return info;
+}
+
+/* ---------- картинка для проекции ---------- */
+/** Columns [x0, x1) of the band that hold anything lit, or null. */
+function extent(band, x0, x1) {
+    let a = -1, b = -1;
+    for (let x = x0; x < x1; x++) {
+        let lit = false;
+        for (let y = 4; y < BAND.h - 4 && !lit; y += 2) {
+            const i = (y * BAND.w + x) * 4;
+            lit = band[i] > 70 || band[i + 1] > 70 || band[i + 2] > 70;
+        }
+        if (lit) { if (a < 0) a = x; b = x + 1; }
+    }
+    return a < 0 ? null : { x: a, w: b - a };
+}
+/** A part of the band as RGBA with the dark background see-through (dark is see-through on the glass). */
+function cut(band, x0, w) {
+    const out = Buffer.alloc(w * BAND.h * 4);
+    for (let y = 0; y < BAND.h; y++) for (let x = 0; x < w; x++) {
+        const s = (y * BAND.w + x0 + x) * 4, d = (y * w + x) * 4;
+        const b = band[s], g = band[s + 1], r = band[s + 2], m = Math.max(r, g, b);
+        const a = m <= 44 ? 0 : m >= 104 ? 255 : Math.round((m - 44) * 4.25);
+        out[d] = r; out[d + 1] = g; out[d + 2] = b; out[d + 3] = a;
+    }
+    return { w: w, data: out };
+}
+/**
+ * The picture for the glass (OUT_W x OUT_H RGBA): the icons and the distance moved together, centred.
+ * show: 'all' (as on the tile), 'icon' (the first icon and the distance), 'dist' (the distance only).
+ * keptLeft: the icons' part from the last frame that showed them whole, for when a BMW window covers them now.
+ */
+function compose(band, leftOk, keptLeft, show) {
+    let left = null;
+    if (show !== 'dist') {
+        const src = show === 'icon' ? SRC_ICON : SRC_LEFT;
+        if (leftOk) { const e = extent(band, src.x, src.x + src.w); if (e) left = cut(band, e.x, e.w); }
+        else left = keptLeft || null;
+    }
+    const re = extent(band, SRC_RIGHT.x, SRC_RIGHT.x + SRC_RIGHT.w);
+    const right = re ? cut(band, re.x, re.w) : null;
+    const total = (left ? left.w : 0) + (left && right ? GAP : 0) + (right ? right.w : 0);
+    const out = Buffer.alloc(OUT_W * OUT_H * 4);
+    let x = Math.max(0, Math.floor((OUT_W - total) / 2));
+    [left, right].forEach((p) => {
+        if (!p) return;
+        const w = Math.min(p.w, OUT_W - x);
+        for (let y = 0; y < OUT_H && w > 0; y++) p.data.copy(out, (y * OUT_W + x) * 4, y * p.w * 4, (y * p.w + w) * 4);
+        x += p.w + GAP;
+    });
+    return { image: out, left: left };
+}
+
+/* ---------- образец для кнопки «Пример», пока служба не видела настоящего предупреждения ---------- */
+const FONT = {      // 5 x 7, по строкам
+    '0': '01110,10001,10011,10101,11001,10001,01110', '5': '11111,10000,11110,00001,00001,10001,01110',
+    '6': '00110,01000,10000,11110,10001,10001,01110', 'm': '00000,00000,10001,11011,10101,10001,10001',
+};
+/** A band laid out like the real tile's (a camera icon, a limit sign, the dots, the distance), drawn here. */
+function sampleBand() {
+    const b = Buffer.alloc(BAND_BYTES);
+    for (let i = 0; i < b.length; i += 4) { b[i] = 26; b[i + 1] = 20; b[i + 2] = 17; b[i + 3] = 255; }
+    const px = (x, y, r, g, bl) => { if (x >= 0 && y >= 0 && x < BAND.w && y < BAND.h) { const i = (y * BAND.w + x) * 4; b[i] = bl; b[i + 1] = g; b[i + 2] = r; } };
+    const rect = (x0, y0, w, h, c) => { for (let y = y0; y < y0 + h; y++) for (let x = x0; x < x0 + w; x++) px(x, y, c[0], c[1], c[2]); };
+    const disc = (cx, cy, r0, r1, c) => { for (let y = cy - r1; y <= cy + r1; y++) for (let x = cx - r1; x <= cx + r1; x++) { const d = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy)); if (d >= r0 && d <= r1) px(x, y, c[0], c[1], c[2]); } };
+    const glyph = (ch, x0, y0, k, c) => { FONT[ch].split(',').forEach((row, j) => row.split('').forEach((v, i) => { if (v === '1') rect(x0 + i * k, y0 + j * k, k, k, c); })); return 6 * k; };
+    const WHITE = [255, 255, 255], BLACK = [20, 20, 20], RED = [226, 30, 40], GREEN = [60, 210, 90];
+    rect(10, 6, 90, 88, WHITE);                                      // a camera, schematically
+    rect(30, 34, 50, 34, BLACK); rect(42, 26, 18, 8, BLACK); disc(55, 51, 0, 10, WHITE); disc(55, 51, 0, 5, BLACK);
+    rect(112, 6, 90, 88, WHITE);                                     // the limit sign
+    disc(157, 50, 33, 40, RED);
+    glyph('6', 139, 36, 4, BLACK); glyph('0', 159, 36, 4, BLACK);
+    [28, 50, 72].forEach((y) => disc(226, y, 0, 4, GREEN));          // the dots
+    let x = 372;                                                     // the distance, as the tile writes it
+    '500'.split('').forEach((ch) => { x += glyph(ch, x, 37, 4, WHITE); });
+    glyph('m', x + 6, 37, 4, WHITE);
+    return b;
+}
+
+/* ---------- проекция ---------- */
+const CLAIM_DIR = '/dev/shm/mgu-hud', CLAIM_ID = 'hudradar';
+class Hud {
+    constructor() {
+        this.cr = null; this.layer = 0; this.geo = null; this.hold = false; this.image = null;
+        this.visible = false; this.target = ''; this.disabled = false; this.claimTimer = null;
+        this.blank = Buffer.alloc(OUT_W * OUT_H * 4);
+    }
+    start() {
+        const ClusterRender = clusterRenderClient().ClusterRender;
+        const cr = this.cr = new ClusterRender(CLAIM_ID, CR_SOCKET);
+        cr.on('ready', () => {
+            log('hud: connected to cluster-render (' + cr.backend + ')');
+            if (!this.layer && this.geo) this._make();
+            this._apply(true);
+        });
+        cr.on('disconnected', () => { this.target = ''; log('hud: cluster-render went away, reconnecting'); });
+        cr.on('target', (name, state, holder, reason, guideDisabled, disabled) => {
+            if (name !== 'hud') return;
+            const was = this.target + (this.disabled ? '!' : '');
+            this.target = state; this.disabled = !!disabled;
+            const now = state + (disabled ? '!' : '');
+            if (now !== was) log('hud: target ' + (disabled ? 'disabled by the mapping guard' : state + (holder ? ' behind ' + holder : '')));
+        });
+        cr.on('refused', (op, ref, reason) => log('hud: refused ' + op + ' ' + ref + ': ' + reason));
+        cr.on('error', (e) => log('hud: ' + (e && e.message)));
+        cr.connect();
+    }
+    _make() {
+        const g = this.geo;
+        this.layer = this.cr.image({ target: 'hud', klass: 'overlay', x: g.x, y: g.y, w: g.w, h: g.h, iw: OUT_W, ih: OUT_H,
+            fps: 15, visible: false, opacity: g.opacity, sampling: 'bilinear' });
+        this.visible = false;
+    }
+    /** Where and how bright: { x, y, w, h, opacity }. */
+    configure(geo) {
+        this.geo = geo;
+        if (!this.cr || !this.cr.ready) return;
+        if (!this.layer) this._make(); else this.cr.set(this.layer, geo);
+    }
+    /** hold: keep the slot on the glass all the time (a clear picture when there is nothing to show). */
+    setHold(on) { if (this.hold !== on) { this.hold = on; this._apply(false); } }
+    /** The picture to show, or null for none. */
+    show(image) { this.image = image; this._apply(true); }
+    _apply(pixels) {
+        const want = !!(this.hold || this.image);
+        if (!this.cr || !this.cr.ready || !this.layer) return;
+        if (want && (pixels || !this.visible)) this.cr.pixels(this.layer, null, this.image || this.blank);
+        if (want !== this.visible) { this.cr.set(this.layer, { visible: want }); this.visible = want; this._claim(want); }
+    }
+    /** For the status file: shown | waiting (BMW has the slot) | hidden | disabled (the mapping guard) | off. */
+    state() {
+        if (!this.cr || !this.cr.ready) return 'off';
+        if (this.disabled) return 'disabled';
+        if (!this.visible) return 'hidden';
+        return this.target === 'shown' ? 'shown' : this.target === 'waiting' ? 'waiting' : 'hidden';
+    }
+    stop() {
+        this.hold = false; this.image = null; this._apply(false); this._claim(false);
+        if (this.cr) { try { if (this.layer) this.cr.drop(this.layer); this.cr.removeAllListeners(); this.cr.close(); } catch (e) { /* closing */ } this.cr = null; }
+    }
+    /* другие приложения из Store уступают проекцию тому, чья заявка свежая (kit/runtime/hud_claim.js в idrive7-apps) */
+    _claim(on) {
+        const touch = (held) => {
+            try {
+                try { fs.mkdirSync(CLAIM_DIR); fs.chmodSync(CLAIM_DIR, 0o1777); } catch (e) { /* there */ }
+                const f = path.join(CLAIM_DIR, CLAIM_ID), tmp = f + '.' + process.pid + '.tmp';
+                fs.writeFileSync(tmp, JSON.stringify({ held: held, at: Date.now() }) + '\n'); fs.renameSync(tmp, f);
+            } catch (e) { /* no tmpfs */ }
+        };
+        if (this.claimTimer) { clearInterval(this.claimTimer); this.claimTimer = null; }
+        touch(on);
+        if (on) this.claimTimer = setInterval(() => touch(true), 2000);
+    }
+}
+
+/* ---------- логика показа ---------- */
+class Tracker {
+    /** onPicture(image | null): the warning's picture changed, or there is none. onAlert(band): a warning began. */
+    constructor(refMask, onPicture, onAlert) {
+        this.ref = refMask; this.onPicture = onPicture; this.onAlert = onAlert; this.show = 'all';
+        this.pending = null; this.state = 'none'; this.keptLeft = null; this.lastAlertAt = 0; this.shownSince = 0;
+        this.shownBand = null; this.visible = false; this.candSince = 0; this.idleSince = 0; this.unknownLogged = false;
+        this.stats = { frames: 0, alerts: 0, pictures: 0 };
+    }
+    /** A new picture of the tile. hs-cap.py sends one only once two reads in a row agreed. */
+    frame(title, band) {
+        this.stats.frames++;
+        const info = classify(title, band, this.ref);
+        this.pending = { info: info, band: Buffer.from(band) };
+        this._commit(this.pending);
+        this._tick();
+    }
+    /** The tile as last read, again. */
+    same() { if (this.pending) this._commit(this.pending); this._tick(); }
+    /** The screen cannot be read, or nobody is reading it. */
+    lost() { this.pending = null; this._set('unknown'); this._tick(); }
+    /** What to show changed ('all' | 'icon' | 'dist'): redraw the warning on the glass, if any. */
+    setShow(show) {
+        if (show === this.show) return;
+        this.show = show; this.keptLeft = null;
+        if (this.state === 'alert' && this.shownBand) { this.shownBand = null; if (this.pending) this._commit(this.pending); }
+    }
+    _put(image) { this.visible = !!image; this.onPicture(image); }
+    _commit(p) {
+        const st = p.info.state;
+        if (st === 'alert') {
+            const now = Date.now();
+            this.idleSince = 0;
+            if (this.state !== 'alert') {
+                if (!this.candSince) this.candSince = now;
+                if (now - this.candSince < ON_MS) return;          // a flash of a warning between two states is not shown
+                this.stats.alerts++; log('alert on ' + JSON.stringify(p.info));
+                if (p.info.leftOk) this.onAlert(p.band);
+            }
+            this.lastAlertAt = now;
+            this.state = 'alert'; this.unknownLogged = false;
+            /* the same warning as shown, but for the video's noise: nothing to send */
+            const same = this.shownBand ? bandDiff(this.shownBand, p.band) <= 12 : false;
+            if (same && this.visible && now - this.shownSince < STALE_MS) return;
+            const c = compose(p.band, p.info.leftOk, this.keptLeft, this.show);
+            if (p.info.leftOk) this.keptLeft = c.left;
+            if (!same) { this.shownSince = now; this.stats.pictures++; }
+            this.shownBand = p.band;
+            this._put(now - this.shownSince < STALE_MS ? c.image : null);
+        } else this._set(st, p.info);
+    }
+    _set(st, info) {
+        this.candSince = 0;
+        if (st === 'idle') {
+            if (this.state === 'alert') {
+                const now = Date.now();
+                if (!this.idleSince) this.idleSince = now;
+                if (now - this.idleSince < OFF_MS) return;
+                log('alert off');
+            }
+            this.idleSince = 0;
+            this.state = 'idle'; this.keptLeft = null; this.shownBand = null;
+            if (this.visible) this._put(null);
+        } else if (this.state === 'alert') {
+            if (!this.unknownLogged) { log('tile hidden or changing ' + JSON.stringify(info || {})); this.unknownLogged = true; }
+            return;                                              // _tick drops it after HOLD_MS
+        } else this.state = 'unknown';
+        this.unknownLogged = false;
+    }
+    _tick() {
+        const now = Date.now();
+        if (this.state === 'alert' && this.unknownLogged && now - this.lastAlertAt > HOLD_MS) {
+            log('alert dropped: the tile stayed hidden');
+            this.state = 'unknown'; this.keptLeft = null; this.shownBand = null; this.unknownLogged = false;
+            if (this.visible) this._put(null);
+        }
+        if (this.state === 'alert' && this.visible && now - this.shownSince > STALE_MS) { log('alert dropped: unchanged too long'); this._put(null); }
+    }
+    /** Forget everything (the capture stopped). */
+    reset() {
+        this.pending = null; this.state = 'none'; this.keptLeft = null; this.shownBand = null; this.candSince = 0; this.idleSince = 0;
+        this.unknownLogged = false;
+        if (this.visible) this._put(null);
+    }
+}
+
+/* ---------- настройки ---------- */
+const DEFAULTS = { mode: 'auto', show: 'all', size: 85, pos: 0, bright: 100 };
+function clean(c) {
+    const o = Object.assign({}, DEFAULTS);
+    if (!c || typeof c !== 'object') return o;
+    if (['auto', 'on', 'off'].indexOf(c.mode) >= 0) o.mode = c.mode;
+    if (['all', 'icon', 'dist'].indexOf(c.show) >= 0) o.show = c.show;
+    const num = (v, lo, hi, d) => { const n = Number(v); return isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; };
+    o.size = num(c.size, 40, 160, o.size); o.pos = num(c.pos, -120, 120, o.pos); o.bright = num(c.bright, 10, 100, o.bright);
+    return o;
+}
+function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; } }
+function writeWhole(file, text) { const tmp = file + '.' + process.pid + '.tmp'; fs.writeFileSync(tmp, text); fs.renameSync(tmp, file); }
+function geometry(cfg) {
+    const k = cfg.size / 100, w = Math.round(OUT_W * k), h = Math.round(OUT_H * k);
+    return { x: Math.round((SCENE_W - w) / 2), y: Math.round(CENTRE_Y + cfg.pos - h / 2), w: w, h: h, opacity: Math.round(cfg.bright) / 100 };
+}
+
+/* ---------- CarPlay на экране? ---------- */
+/**
+ * While CarPlay is on the display, the head unit's carplay process runs its video decoder (threads named
+ * NmeVideoDevice, NmePlayback); it stops them when the display goes to BMW's own menu. HR_CARPLAY_FILE: a test's
+ * stand-in, a file holding 1 or 0.
+ */
+let carplayPid = 0;
+function carplayOnScreen() {
+    if (process.env.HR_CARPLAY_FILE) { try { return fs.readFileSync(process.env.HR_CARPLAY_FILE, 'utf8').trim() === '1'; } catch (e) { return false; } }
+    const comm = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch (e) { return ''; } };
+    if (!carplayPid || comm('/proc/' + carplayPid + '/comm') !== 'carplay') {
+        carplayPid = 0;
+        let pids = [];
+        try { pids = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d)); } catch (e) { return false; }
+        for (let i = 0; i < pids.length; i++) if (comm('/proc/' + pids[i] + '/comm') === 'carplay') { carplayPid = Number(pids[i]); break; }
+        if (!carplayPid) return false;
+    }
+    let tasks = [];
+    try { tasks = fs.readdirSync('/proc/' + carplayPid + '/task'); } catch (e) { return false; }
+    for (let i = 0; i < tasks.length; i++) if (/^Nme(VideoDevice|Playback)/.test(comm('/proc/' + carplayPid + '/task/' + tasks[i] + '/comm'))) return true;
+    return false;
+}
+
+/* ---------- служба ---------- */
+function main() {
+    log('hudradar ' + VERSION + (bundled ? '' : ' (from source)'));
+    try { fs.mkdirSync(SHM); } catch (e) { /* there */ }
+    try { fs.chmodSync(SHM, 0o1777); } catch (e) { log('shm: ' + e.message); }     // the app (its own user) writes control.json here
+    [STATE, RUN].forEach((d) => { try { fs.mkdirSync(d); } catch (e) { /* there, or its parent is missing */ } });
+    const CONTROL = path.join(SHM, 'control.json'), STATUS = path.join(SHM, 'status.json');
+    const CONFIG = path.join(STATE, 'config.json'), LAST = path.join(STATE, 'last-band.bin');
+
+    const refMask = Buffer.from(resource('title-mask.b64').trim(), 'base64');
+    let cfg = clean(readJson(CONFIG));
+    let error = '', carplay = false, capture = null, restarts = 0, retryAt = 0, stopping = false;
+    let demoSeen = 0, demoUntil = 0, alertImage = null, checkMs = 0;
+    const started = Date.now();
+
+    const hud = new Hud();
+    const present = () => {                    // what goes on the glass: the example while it runs, else the warning
+        if (Date.now() < demoUntil) return;
+        hud.show(cfg.mode === 'off' ? null : alertImage);
+    };
+    const tracker = new Tracker(refMask, (image) => { alertImage = image; present(); }, (band) => {
+        // keep one real warning for the Example button: this car's own, never shipped
+        try { if (!fs.existsSync(LAST) || Date.now() - fs.statSync(LAST).mtimeMs > 86400000) writeWhole(LAST, band); } catch (e) { /* no state folder */ }
+    });
+    tracker.show = cfg.show;
+    hud.configure(geometry(cfg));
+    try { hud.start(); } catch (e) { error = 'Не установлен Cluster renderer из MGU Store'; log('hud: ' + e.message); }
+
+    /* --- захват --- */
+    let capPath = '';
+    try { capPath = path.join(RUN, 'hs-cap.py'); fs.writeFileSync(capPath, resource('hs-cap.py')); }
+    catch (e) { try { capPath = path.join(SHM, 'hs-cap.py'); fs.writeFileSync(capPath, resource('hs-cap.py')); } catch (e2) { log('capture script: ' + e2.message); } }
+    function startCapture() {
+        if (!fs.existsSync(PYTHON)) { error = 'Не установлен Python (mgu-python) из MGU Store'; return; }
+        const child = capture = spawn(PYTHON, [capPath, process.env.HR_PERIOD || '100'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let buf = Buffer.alloc(0), sum = 0, n = 0;
+        child.stdout.on('data', (d) => {
+            buf = buf.length ? Buffer.concat([buf, d]) : d;
+            for (;;) {
+                if (buf.length < 16) break;
+                if (buf.toString('latin1', 0, 4) !== 'HSF1') { log('capture: stream out of step'); child.kill(); return; }
+                const flags = buf.readUInt32LE(12), need = 16 + (flags === 0 ? TITLE_BYTES + BAND_BYTES : 0);
+                if (buf.length < need) break;
+                sum += buf.readUInt32LE(8) / 10; n++;
+                if (n >= 20) { checkMs = Math.round(sum / n * 10) / 10; sum = 0; n = 0; }
+                if (flags === 0) tracker.frame(buf.slice(16, 16 + TITLE_BYTES), buf.slice(16 + TITLE_BYTES, need));
+                else if (flags === 1) tracker.same();
+                else if (flags === 2) tracker.lost();              // 3: the frame was being redrawn, nothing learnt
+                buf = buf.slice(need);
+            }
+        });
+        child.stderr.on('data', (d) => String(d).split('\n').forEach((l) => { if (l) log(l); }));
+        child.on('error', (e) => log('capture: ' + e.message));
+        child.on('exit', (code, sig) => {
+            if (child.wanted || stopping) return;
+            if (capture === child) capture = null;
+            tracker.reset(); checkMs = 0;
+            log('capture exited (' + (sig || code) + ')');
+            if (code === 3) { error = 'Чтение экрана слишком нагружает головное устройство: пауза 10 минут'; retryAt = Date.now() + 600000; }
+            else if (++restarts > 30) { error = 'Чтение экрана не запускается: пауза 10 минут'; retryAt = Date.now() + 600000; restarts = 0; }
+            else retryAt = Date.now() + 5000;
+        });
+    }
+    /** Stop reading the display (the mode, or CarPlay left it). The next start reads the tile afresh. */
+    function stopCapture() {
+        if (!capture) return;
+        const child = capture; capture = null; child.wanted = true;
+        try { child.kill(); } catch (e) { /* gone */ }
+        tracker.reset(); checkMs = 0;
+    }
+
+    /* --- пример --- */
+    function demo() {
+        let band = null;
+        try { const b = fs.readFileSync(LAST); if (b.length === BAND_BYTES) band = b; } catch (e) { /* none kept yet */ }
+        if (!band) band = sampleBand();
+        demoUntil = Date.now() + DEMO_MS;
+        hud.show(compose(band, true, null, cfg.show).image);
+        log('example on the glass');
+        setTimeout(() => { if (Date.now() >= demoUntil) { demoUntil = 0; present(); } }, DEMO_MS + 50);
+    }
+
+    /* --- раз в полсекунды: настройки, CarPlay, что должно работать --- */
+    let controlMtime = 0, lastCarplayCheck = 0, lastStatus = 0;
+    function tick() {
+        const now = Date.now();
+        try {
+            const m = fs.statSync(CONTROL).mtimeMs;
+            if (m !== controlMtime) {
+                controlMtime = m;
+                const raw = readJson(CONTROL), next = clean(raw);
+                if (JSON.stringify(next) !== JSON.stringify(cfg)) {
+                    log('settings ' + JSON.stringify(next));
+                    cfg = next;
+                    hud.configure(geometry(cfg)); tracker.setShow(cfg.show);
+                    try { writeWhole(CONFIG, JSON.stringify(cfg) + '\n'); } catch (e) { log('config: ' + e.message); }
+                    present();
+                }
+                const d = raw && Number(raw.demo) || 0;
+                if (d && d !== demoSeen) { const first = demoSeen === 0 && now - started < 3000 && now - d > 10000; demoSeen = d; if (!first) demo(); }
+            }
+        } catch (e) { /* no control file: the app has not run since the start */ }
+
+        if (now - lastCarplayCheck >= 1500) { lastCarplayCheck = now; const c = carplayOnScreen(); if (c !== carplay) { carplay = c; log('carplay ' + (c ? 'on' : 'off') + ' the display'); } }
+        const demoOn = now < demoUntil;
+        hud.setHold(demoOn || cfg.mode === 'on' || (cfg.mode === 'auto' && carplay));
+        const read = cfg.mode === 'on' || (cfg.mode === 'auto' && carplay);          // read the display at all?
+        if (read) {
+            if (!capture && now >= retryAt && capPath) { if (retryAt && error.indexOf('пауза') >= 0) error = ''; startCapture(); }
+        } else stopCapture();
+
+        if (now - lastStatus >= 1000) {
+            lastStatus = now;
+            const st = {
+                version: VERSION, mode: cfg.mode, show: cfg.show, carplay: carplay,
+                tile: tracker.state === 'none' ? 'unknown' : tracker.state, hud: hud.state(), demo: demoOn,
+                alerts: tracker.stats.alerts, pictures: tracker.stats.pictures, checkMs: capture ? checkMs : 0,
+                error: error, at: now,
+            };
+            try { writeWhole(STATUS, JSON.stringify(st) + '\n'); fs.chmodSync(STATUS, 0o644); } catch (e) { /* no tmpfs */ }
+        }
+    }
+    setInterval(() => { try { tick(); } catch (e) { log('tick: ' + (e && e.stack || e)); } }, 500);
+    setInterval(() => log('alive: mode ' + cfg.mode + ', carplay ' + (carplay ? 'on' : 'off') + ', tile ' + tracker.state + ', hud ' + hud.state() +
+        ', ' + tracker.stats.alerts + ' alerts, ' + tracker.stats.pictures + ' pictures, check ' + checkMs + ' ms'), 300000);
+
+    const finish = () => {                                            // systemd stops the service: leave cleanly
+        if (stopping) return; stopping = true;
+        log('stopping');
+        if (capture) { try { capture.kill(); } catch (e) { /* gone */ } }
+        hud.stop();
+        try { fs.unlinkSync(STATUS); } catch (e) { /* none */ }
+        setTimeout(() => process.exit(0), 300);
+    };
+    process.on('SIGINT', finish); process.on('SIGTERM', finish);
+    // any other trouble is logged and lived through: an exit would have systemd restart the service over and over
+    process.on('uncaughtException', (e) => { log('error: ' + (e && e.stack || e)); });
+}
+
+module.exports = { classify, compose, titleMask, sampleBand, clean, geometry, BAND, TITLE, OUT_W, OUT_H, VERSION };
+if (require.main === module || bundled) main();
+
+})();

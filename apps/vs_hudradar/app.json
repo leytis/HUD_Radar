@@ -1,0 +1,75 @@
+{
+  "id": "vs_hudradar",
+  "title": "Radar HUD",
+  "description": "Предупреждения о камерах с плитки HUD Speed (дашборд CarPlay) на проекции. Нужна служба Radar HUD service.",
+  "version": "1.0.0",
+  "vendor": "custom",
+  "loggingId": "OAV1",
+  "iconGlyph": "HUD",
+  "signals": {},
+  "screens": [
+    {
+      "name": "MAIN",
+      "kind": "canvas",
+      "title": "Radar HUD",
+      "buttons": [
+        ["BTN_MODE", "Режим"],
+        ["BTN_DEMO", "Пример"],
+        ["BTN_SETTINGS", "Настройки"]
+      ]
+    }
+  ],
+  "settings": [
+    {
+      "key": "mode",
+      "label": "Режим",
+      "type": "choice",
+      "default": "auto",
+      "options": [
+        ["auto", "Авто: пока на экране CarPlay"],
+        ["on", "Включено всегда"],
+        ["off", "Выключено"]
+      ]
+    },
+    {
+      "key": "show",
+      "label": "Что показывать",
+      "type": "choice",
+      "default": "all",
+      "options": [
+        ["all", "Всё как на плитке"],
+        ["icon", "Значок и дистанция"],
+        ["dist", "Только дистанция"]
+      ]
+    },
+    {
+      "key": "size",
+      "label": "Размер",
+      "type": "number",
+      "unit": "%",
+      "default": 85,
+      "steps": [60, 70, 85, 100, 115, 130]
+    },
+    {
+      "key": "pos",
+      "label": "Положение по высоте",
+      "type": "choice",
+      "default": "0",
+      "options": [
+        ["-60", "Выше"],
+        ["-30", "Чуть выше"],
+        ["0", "По центру"],
+        ["30", "Чуть ниже"],
+        ["60", "Ниже"]
+      ]
+    },
+    {
+      "key": "bright",
+      "label": "Яркость",
+      "type": "number",
+      "unit": "%",
+      "default": 100,
+      "steps": [30, 45, 60, 80, 100]
+    }
+  ]
+}
