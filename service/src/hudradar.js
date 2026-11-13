@@ -9,12 +9,18 @@
  *   Цифры не распознаются: картинка переносится как есть. База камер остаётся в приложении HUD Speed.
  *
  * Управление (приложение Radar HUD):
- *   /dev/shm/hudradar/control.json   настройки от приложения: { mode, show, size, pos, bright, demo }
- *   /dev/shm/hudradar/status.json    что служба делает сейчас, раз в секунду
+ *   /dev/shm/hudradar/control/control.json   настройки от приложения: { mode, show, size, pos, bright, demo }
+ *   /dev/shm/hudradar/status.json            что служба делает сейчас, раз в секунду
  *   <state>/config.json              последние настройки: с ними служба стартует, пока приложение не запущено
  *
  * Режимы: auto - место в проекции занято, пока на экране CarPlay; on - всегда; off - служба ничего не показывает
  * и экран не читает.
+ *
+ * Служба работает от root, а приложения на головном устройстве нет. Поэтому в папку, куда пишут приложения,
+ * она сама ничего не пишет, а читает оттуда только небольшой обычный файл.
+ *
+ * Все отсчёты времени идут по монотонным часам: обычные головное устройство переводит по GPS, и они могут
+ * прыгнуть назад.
  *
  * Служба никогда не завершается сама: её перезапускает systemd, а частые перезапуски он считает сбоем.
  * Node 8. В репозитории это исходник; в Store ставится один файл, собранный service/build.js.
@@ -23,7 +29,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 
 /* ---------- ресурсы: в собранном файле они внутри него, при запуске из исходников лежат рядом ---------- */
 /* global __BUNDLE */
@@ -33,7 +39,6 @@ function clusterRenderClient() { return bundled ? __BUNDLE.clusterRender() : req
 
 const SHM = process.env.HR_SHM || '/dev/shm/hudradar';
 const STATE = process.env.HR_STATE || '/var/opt/hudradar/state';
-const RUN = process.env.HR_RUN || process.env.RUNTIME_DIRECTORY || '/run/hudradar';
 const PYTHON = process.env.HR_PYTHON || '/var/opt/mgu-python/current/bin/python3';
 const CR_SOCKET = process.env.HR_CR_SOCKET || '/dev/shm/cluster-render/render.sock';
 
@@ -57,7 +62,12 @@ const ON_MS = 200;             // предупреждение должно пр
 const OFF_MS = 1500;           // и столько плитка должна быть пустой, прежде чем оно уйдёт
 const DEMO_MS = 8000;
 
+const HOLD_OFF_MS = 5000;      // CarPlay ушёл с экрана: столько ещё держим место (короткий заход в меню BMW его не отдаёт)
+const REMAKE_MS = [5000, 60000];   // слой отвергнут: когда пробовать снова
+
 function log(s) { process.stdout.write(s + '\n'); }
+/** Milliseconds on a clock that never jumps (the head unit's wall clock is set from GPS). */
+function mono() { const t = process.hrtime(); return t[0] * 1000 + Math.floor(t[1] / 1e6); }
 
 /* ---------- что на плитке ---------- */
 function count(buf, bw, r, pred) {
@@ -190,7 +200,8 @@ const CLAIM_DIR = '/dev/shm/mgu-hud', CLAIM_ID = 'hudradar';
 class Hud {
     constructor() {
         this.cr = null; this.layer = 0; this.geo = null; this.hold = false; this.image = null;
-        this.visible = false; this.target = ''; this.disabled = false; this.claimTimer = null;
+        this.visible = false; this.target = ''; this.holder = ''; this.disabled = false; this.claimTimer = null;
+        this.remakeTimer = null; this.remakes = 0;
         this.blank = Buffer.alloc(OUT_W * OUT_H * 4);
     }
     start() {
@@ -198,18 +209,26 @@ class Hud {
         const cr = this.cr = new ClusterRender(CLAIM_ID, CR_SOCKET);
         cr.on('ready', () => {
             log('hud: connected to cluster-render (' + cr.backend + ')');
-            if (!this.layer && this.geo) this._make();
+            if (!this.layer && this.geo && !this.remakeTimer) this._make();
             this._apply(true);
         });
         cr.on('disconnected', () => { this.target = ''; log('hud: cluster-render went away, reconnecting'); });
         cr.on('target', (name, state, holder, reason, guideDisabled, disabled) => {
             if (name !== 'hud') return;
             const was = this.target + (this.disabled ? '!' : '');
-            this.target = state; this.disabled = !!disabled;
+            this.target = state; this.holder = holder || ''; this.disabled = !!disabled;
             const now = state + (disabled ? '!' : '');
             if (now !== was) log('hud: target ' + (disabled ? 'disabled by the mapping guard' : state + (holder ? ' behind ' + holder : '')));
         });
-        cr.on('refused', (op, ref, reason) => log('hud: refused ' + op + ' ' + ref + ': ' + reason));
+        cr.on('layer', (ref, state, reason) => {
+            if (ref !== this.layer) return;
+            if (state === 'error') { log('hud: layer error' + (reason ? ' (' + reason + ')' : '')); this._remake(); }
+            else if (state === 'shown') this.remakes = 0;
+        });
+        cr.on('refused', (op, ref, reason) => {
+            log('hud: refused ' + op + ' ' + ref + ': ' + reason);
+            if (ref && ref === this.layer && op === 'layer') this._remake();
+        });
         cr.on('error', (e) => log('hud: ' + (e && e.message)));
         cr.connect();
     }
@@ -219,11 +238,23 @@ class Hud {
             fps: 15, visible: false, opacity: g.opacity, sampling: 'bilinear' });
         this.visible = false;
     }
+    /** The renderer refused the layer: drop it and make it again later (5 s, then once a minute). */
+    _remake() {
+        if (this.remakeTimer || !this.cr) return;
+        try { if (this.layer) this.cr.drop(this.layer); } catch (e) { /* gone with the connection */ }
+        this.layer = 0; this.visible = false; this._claim(false);
+        const wait = REMAKE_MS[Math.min(this.remakes++, REMAKE_MS.length - 1)];
+        this.remakeTimer = setTimeout(() => {
+            this.remakeTimer = null;
+            if (!this.cr || !this.cr.ready || this.layer || !this.geo) return;
+            this._make(); this._apply(true);
+        }, wait);
+    }
     /** Where and how bright: { x, y, w, h, opacity }. */
     configure(geo) {
         this.geo = geo;
         if (!this.cr || !this.cr.ready) return;
-        if (!this.layer) this._make(); else this.cr.set(this.layer, geo);
+        if (this.layer) this.cr.set(this.layer, geo); else if (!this.remakeTimer) this._make();
     }
     /** hold: keep the slot on the glass all the time (a clear picture when there is nothing to show). */
     setHold(on) { if (this.hold !== on) { this.hold = on; this._apply(false); } }
@@ -235,14 +266,22 @@ class Hud {
         if (want && (pixels || !this.visible)) this.cr.pixels(this.layer, null, this.image || this.blank);
         if (want !== this.visible) { this.cr.set(this.layer, { visible: want }); this.visible = want; this._claim(want); }
     }
-    /** For the status file: shown | waiting (BMW has the slot) | hidden | disabled (the mapping guard) | off. */
+    /**
+     * For the status file: shown | waiting (BMW's own content has the slot: parked behind it, or giving way to a
+     * pop-up) | starting | hidden (nothing asked for) | unavailable | disabled (the mapping guard) | off (no renderer).
+     */
     state() {
         if (!this.cr || !this.cr.ready) return 'off';
         if (this.disabled) return 'disabled';
+        if (!this.layer) return 'unavailable';
         if (!this.visible) return 'hidden';
-        return this.target === 'shown' ? 'shown' : this.target === 'waiting' ? 'waiting' : 'hidden';
+        if (this.target === 'shown' || this.target === 'lingering') return 'shown';
+        if (this.target === 'parked' || this.target === 'waiting') return 'waiting';
+        if (this.target === 'unavailable') return 'unavailable';
+        return 'starting';
     }
     stop() {
+        if (this.remakeTimer) { clearTimeout(this.remakeTimer); this.remakeTimer = null; }
         this.hold = false; this.image = null; this._apply(false); this._claim(false);
         if (this.cr) { try { if (this.layer) this.cr.drop(this.layer); this.cr.removeAllListeners(); this.cr.close(); } catch (e) { /* closing */ } this.cr = null; }
     }
@@ -251,8 +290,8 @@ class Hud {
         const touch = (held) => {
             try {
                 try { fs.mkdirSync(CLAIM_DIR); fs.chmodSync(CLAIM_DIR, 0o1777); } catch (e) { /* there */ }
-                const f = path.join(CLAIM_DIR, CLAIM_ID), tmp = f + '.' + process.pid + '.tmp';
-                fs.writeFileSync(tmp, JSON.stringify({ held: held, at: Date.now() }) + '\n'); fs.renameSync(tmp, f);
+                const f = path.join(CLAIM_DIR, CLAIM_ID), tmp = f + '.' + process.pid + '.tmp';   // .tmp: the others skip it
+                writeNew(tmp, JSON.stringify({ held: held, at: Date.now() }) + '\n'); fs.renameSync(tmp, f);
             } catch (e) { /* no tmpfs */ }
         };
         if (this.claimTimer) { clearInterval(this.claimTimer); this.claimTimer = null; }
@@ -292,7 +331,7 @@ class Tracker {
     _commit(p) {
         const st = p.info.state;
         if (st === 'alert') {
-            const now = Date.now();
+            const now = mono();
             this.idleSince = 0;
             if (this.state !== 'alert') {
                 if (!this.candSince) this.candSince = now;
@@ -316,7 +355,7 @@ class Tracker {
         this.candSince = 0;
         if (st === 'idle') {
             if (this.state === 'alert') {
-                const now = Date.now();
+                const now = mono();
                 if (!this.idleSince) this.idleSince = now;
                 if (now - this.idleSince < OFF_MS) return;
                 log('alert off');
@@ -331,7 +370,7 @@ class Tracker {
         this.unknownLogged = false;
     }
     _tick() {
-        const now = Date.now();
+        const now = mono();
         if (this.state === 'alert' && this.unknownLogged && now - this.lastAlertAt > HOLD_MS) {
             log('alert dropped: the tile stayed hidden');
             this.state = 'unknown'; this.keptLeft = null; this.shownBand = null; this.unknownLogged = false;
@@ -359,7 +398,26 @@ function clean(c) {
     return o;
 }
 function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; } }
-function writeWhole(file, text) { const tmp = file + '.' + process.pid + '.tmp'; fs.writeFileSync(tmp, text); fs.renameSync(tmp, file); }
+/**
+ * A new file, never through a link: this runs as root and some folders it writes in are open to every app, where a
+ * link left under the name would send the write anywhere.
+ */
+function writeNew(file, data) {
+    try { fs.unlinkSync(file); } catch (e) { /* none */ }
+    const fd = fs.openSync(file, 'wx', 0o644);             // O_EXCL: fails on anything there, a link included
+    const b = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
+    try { fs.writeSync(fd, b, 0, b.length); } finally { fs.closeSync(fd); }
+}
+/** A file written whole or not at all: a new file renamed over the old one. */
+function writeWhole(file, data) { const tmp = file + '.' + process.pid + '.tmp'; writeNew(tmp, data); fs.renameSync(tmp, file); }
+/** A small plain file's JSON, or null: what an app left for us is read only if it is that (no link, no pipe). */
+function readSmallJson(file) {
+    try {
+        const st = fs.lstatSync(file);
+        if (!st.isFile() || st.size > 4096) return null;
+        return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (e) { return null; }
+}
 function geometry(cfg) {
     const k = cfg.size / 100, w = Math.round(OUT_W * k), h = Math.round(OUT_H * k);
     return { x: Math.round((SCENE_W - w) / 2), y: Math.round(CENTRE_Y + cfg.pos - h / 2), w: w, h: h, opacity: Math.round(cfg.bright) / 100 };
@@ -391,21 +449,35 @@ function carplayOnScreen() {
 /* ---------- служба ---------- */
 function main() {
     log('hudradar ' + VERSION + (bundled ? '' : ' (from source)'));
-    try { fs.mkdirSync(SHM); } catch (e) { /* there */ }
-    try { fs.chmodSync(SHM, 0o1777); } catch (e) { log('shm: ' + e.message); }     // the app (its own user) writes control.json here
-    [STATE, RUN].forEach((d) => { try { fs.mkdirSync(d); } catch (e) { /* there, or its parent is missing */ } });
-    const CONTROL = path.join(SHM, 'control.json'), STATUS = path.join(SHM, 'status.json');
+    /*
+     * SHM is ours alone (root, 0755): the status file. SHM/control is open to every app (1777, as /tmp): the app
+     * leaves its settings there. An app that ran before us may have made SHM itself: it is taken over.
+     */
+    const CONTROL_DIR = path.join(SHM, 'control');
+    const CONTROL = path.join(CONTROL_DIR, 'control.json'), STATUS = path.join(SHM, 'status.json');
     const CONFIG = path.join(STATE, 'config.json'), LAST = path.join(STATE, 'last-band.bin');
+    const folder = (dir, mode) => {
+        try { fs.mkdirSync(dir); } catch (e) { /* there */ }
+        try {
+            if (fs.lstatSync(dir).isSymbolicLink()) { fs.unlinkSync(dir); fs.mkdirSync(dir); }
+            if (process.getuid && process.getuid() === 0) fs.chownSync(dir, 0, 0);
+            fs.chmodSync(dir, mode);
+        } catch (e) { log('folder ' + dir + ': ' + e.message); }
+    };
+    folder(SHM, 0o755); folder(CONTROL_DIR, 0o1777);
+    try { fs.mkdirSync(STATE); } catch (e) { /* there, or its parent is missing */ }
 
     const refMask = Buffer.from(resource('title-mask.b64').trim(), 'base64');
     let cfg = clean(readJson(CONFIG));
-    let error = '', carplay = false, capture = null, restarts = 0, retryAt = 0, stopping = false;
-    let demoSeen = 0, demoUntil = 0, alertImage = null, checkMs = 0;
-    const started = Date.now();
+    let error = '', carplay = false, carplaySeenAt = -1e9, capture = null, restarts = 0, retryAt = 0, stopping = false;
+    let demoUntil = 0, alertImage = null, checkMs = 0;
+    // a request for the example left from before this start is not one to show now
+    const before = readSmallJson(CONTROL);
+    let demoSeen = before && Number(before.demo) || 0;
 
     const hud = new Hud();
     const present = () => {                    // what goes on the glass: the example while it runs, else the warning
-        if (Date.now() < demoUntil) return;
+        if (mono() < demoUntil) return;
         hud.show(cfg.mode === 'off' ? null : alertImage);
     };
     const tracker = new Tracker(refMask, (image) => { alertImage = image; present(); }, (band) => {
@@ -416,23 +488,23 @@ function main() {
     hud.configure(geometry(cfg));
     try { hud.start(); } catch (e) { error = 'Не установлен Cluster renderer из MGU Store'; log('hud: ' + e.message); }
 
-    /* --- захват --- */
-    let capPath = '';
-    try { capPath = path.join(RUN, 'hs-cap.py'); fs.writeFileSync(capPath, resource('hs-cap.py')); }
-    catch (e) { try { capPath = path.join(SHM, 'hs-cap.py'); fs.writeFileSync(capPath, resource('hs-cap.py')); } catch (e2) { log('capture script: ' + e2.message); } }
+    /* --- захват: скрипт идёт интерпретатору аргументом, файла на диске у него нет --- */
+    const capScript = resource('hs-cap.py');
     function startCapture() {
-        if (!fs.existsSync(PYTHON)) { error = 'Не установлен Python (mgu-python) из MGU Store'; return; }
-        const child = capture = spawn(PYTHON, [capPath, process.env.HR_PERIOD || '100'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        if (!fs.existsSync(PYTHON)) { error = 'Не установлен Python (mgu-python) из MGU Store'; retryAt = mono() + 30000; return; }
+        const child = capture = spawn(PYTHON, ['-c', capScript, process.env.HR_PERIOD || '100'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        const startedAt = mono();
         let buf = Buffer.alloc(0), sum = 0, n = 0;
         child.stdout.on('data', (d) => {
             buf = buf.length ? Buffer.concat([buf, d]) : d;
             for (;;) {
                 if (buf.length < 16) break;
-                if (buf.toString('latin1', 0, 4) !== 'HSF1') { log('capture: stream out of step'); child.kill(); return; }
+                if (buf.toString('latin1', 0, 4) !== 'HSF1') { log('capture: stream out of step'); buf = Buffer.alloc(0); child.kill(); return; }
                 const flags = buf.readUInt32LE(12), need = 16 + (flags === 0 ? TITLE_BYTES + BAND_BYTES : 0);
                 if (buf.length < need) break;
                 sum += buf.readUInt32LE(8) / 10; n++;
                 if (n >= 20) { checkMs = Math.round(sum / n * 10) / 10; sum = 0; n = 0; }
+                if (error && error.indexOf('Python') >= 0) error = '';
                 if (flags === 0) tracker.frame(buf.slice(16, 16 + TITLE_BYTES), buf.slice(16 + TITLE_BYTES, need));
                 else if (flags === 1) tracker.same();
                 else if (flags === 2) tracker.lost();              // 3: the frame was being redrawn, nothing learnt
@@ -446,9 +518,10 @@ function main() {
             if (capture === child) capture = null;
             tracker.reset(); checkMs = 0;
             log('capture exited (' + (sig || code) + ')');
-            if (code === 3) { error = 'Чтение экрана слишком нагружает головное устройство: пауза 10 минут'; retryAt = Date.now() + 600000; }
-            else if (++restarts > 30) { error = 'Чтение экрана не запускается: пауза 10 минут'; retryAt = Date.now() + 600000; restarts = 0; }
-            else retryAt = Date.now() + 5000;
+            if (mono() - startedAt > 600000) restarts = 0;          // it had run well: an exit now is a new story
+            if (code === 3) { error = 'Чтение экрана слишком нагружает головное устройство: пауза 10 минут'; retryAt = mono() + 600000; }
+            else if (++restarts > 30) { error = 'Чтение экрана не запускается: пауза 10 минут'; retryAt = mono() + 600000; restarts = 0; }
+            else retryAt = mono() + 5000;
         });
     }
     /** Stop reading the display (the mode, or CarPlay left it). The next start reads the tile afresh. */
@@ -464,21 +537,23 @@ function main() {
         let band = null;
         try { const b = fs.readFileSync(LAST); if (b.length === BAND_BYTES) band = b; } catch (e) { /* none kept yet */ }
         if (!band) band = sampleBand();
-        demoUntil = Date.now() + DEMO_MS;
+        demoUntil = mono() + DEMO_MS;
         hud.show(compose(band, true, null, cfg.show).image);
         log('example on the glass');
-        setTimeout(() => { if (Date.now() >= demoUntil) { demoUntil = 0; present(); } }, DEMO_MS + 50);
+        setTimeout(() => { if (mono() >= demoUntil) { demoUntil = 0; present(); } }, DEMO_MS + 50);
     }
 
     /* --- раз в полсекунды: настройки, CarPlay, что должно работать --- */
-    let controlMtime = 0, lastCarplayCheck = 0, lastStatus = 0;
+    let controlStamp = '', lastCarplayCheck = -1e9, lastStatus = -1e9;
     function tick() {
-        const now = Date.now();
-        try {
-            const m = fs.statSync(CONTROL).mtimeMs;
-            if (m !== controlMtime) {
-                controlMtime = m;
-                const raw = readJson(CONTROL), next = clean(raw);
+        const now = mono();
+        let stamp = '';
+        try { const st = fs.lstatSync(CONTROL); stamp = st.ino + ':' + st.mtimeMs + ':' + st.size; } catch (e) { /* the app has not run since the start */ }
+        if (stamp && stamp !== controlStamp) {
+            controlStamp = stamp;
+            const raw = readSmallJson(CONTROL);
+            if (raw && typeof raw === 'object') {
+                const next = clean(raw);
                 if (JSON.stringify(next) !== JSON.stringify(cfg)) {
                     log('settings ' + JSON.stringify(next));
                     cfg = next;
@@ -486,46 +561,57 @@ function main() {
                     try { writeWhole(CONFIG, JSON.stringify(cfg) + '\n'); } catch (e) { log('config: ' + e.message); }
                     present();
                 }
-                const d = raw && Number(raw.demo) || 0;
-                if (d && d !== demoSeen) { const first = demoSeen === 0 && now - started < 3000 && now - d > 10000; demoSeen = d; if (!first) demo(); }
+                const d = Number(raw.demo) || 0;
+                if (d && d !== demoSeen) { demoSeen = d; demo(); }
             }
-        } catch (e) { /* no control file: the app has not run since the start */ }
+        }
 
-        if (now - lastCarplayCheck >= 1500) { lastCarplayCheck = now; const c = carplayOnScreen(); if (c !== carplay) { carplay = c; log('carplay ' + (c ? 'on' : 'off') + ' the display'); } }
+        if (now - lastCarplayCheck >= 1500) {
+            lastCarplayCheck = now;
+            const c = carplayOnScreen();
+            if (c !== carplay) { carplay = c; log('carplay ' + (c ? 'on' : 'off') + ' the display'); }
+            if (c) carplaySeenAt = now;
+        }
         const demoOn = now < demoUntil;
-        hud.setHold(demoOn || cfg.mode === 'on' || (cfg.mode === 'auto' && carplay));
-        const read = cfg.mode === 'on' || (cfg.mode === 'auto' && carplay);          // read the display at all?
-        if (read) {
-            if (!capture && now >= retryAt && capPath) { if (retryAt && error.indexOf('пауза') >= 0) error = ''; startCapture(); }
+        /*
+         * Auto keeps the slot a little after CarPlay leaves the display: a look into BMW's menu and back does not
+         * hand it over. Each hand-over is a new mapping for the cluster, and with BMW's route running ours waits
+         * behind its card afterwards (cluster-render's README, "Arbitration").
+         */
+        hud.setHold(demoOn || cfg.mode === 'on' || (cfg.mode === 'auto' && (carplay || now - carplaySeenAt < HOLD_OFF_MS)));
+        if (cfg.mode === 'on' || (cfg.mode === 'auto' && carplay)) {            // read the display at all?
+            if (!capture && now >= retryAt) { if (error.indexOf('пауза') >= 0) error = ''; startCapture(); }
         } else stopCapture();
 
         if (now - lastStatus >= 1000) {
             lastStatus = now;
             const st = {
                 version: VERSION, mode: cfg.mode, show: cfg.show, carplay: carplay,
-                tile: tracker.state === 'none' ? 'unknown' : tracker.state, hud: hud.state(), demo: demoOn,
+                tile: tracker.state === 'none' ? 'unknown' : tracker.state, hud: hud.state(), holder: hud.holder, demo: demoOn,
                 alerts: tracker.stats.alerts, pictures: tracker.stats.pictures, checkMs: capture ? checkMs : 0,
-                error: error, at: now,
+                error: error, at: Date.now(),
             };
-            try { writeWhole(STATUS, JSON.stringify(st) + '\n'); fs.chmodSync(STATUS, 0o644); } catch (e) { /* no tmpfs */ }
+            try { writeWhole(STATUS, JSON.stringify(st) + '\n'); } catch (e) { /* no tmpfs */ }
         }
     }
     setInterval(() => { try { tick(); } catch (e) { log('tick: ' + (e && e.stack || e)); } }, 500);
     setInterval(() => log('alive: mode ' + cfg.mode + ', carplay ' + (carplay ? 'on' : 'off') + ', tile ' + tracker.state + ', hud ' + hud.state() +
-        ', ' + tracker.stats.alerts + ' alerts, ' + tracker.stats.pictures + ' pictures, check ' + checkMs + ' ms'), 300000);
+        ', ' + tracker.stats.alerts + ' alerts, ' + tracker.stats.pictures + ' pictures, check ' + checkMs + ' ms'), 600000);
 
     const finish = () => {                                            // systemd stops the service: leave cleanly
         if (stopping) return; stopping = true;
         log('stopping');
         if (capture) { try { capture.kill(); } catch (e) { /* gone */ } }
-        hud.stop();
+        try { hud.stop(); } catch (e) { /* the renderer is gone */ }
         try { fs.unlinkSync(STATUS); } catch (e) { /* none */ }
         setTimeout(() => process.exit(0), 300);
     };
     process.on('SIGINT', finish); process.on('SIGTERM', finish);
-    // any other trouble is logged and lived through: an exit would have systemd restart the service over and over
+    // any other trouble is logged and lived through: an exit would only have systemd start the service again
     process.on('uncaughtException', (e) => { log('error: ' + (e && e.stack || e)); });
+    process.on('unhandledRejection', (e) => { log('error: ' + (e && e.stack || e)); });
 }
 
-module.exports = { classify, compose, titleMask, sampleBand, clean, geometry, BAND, TITLE, OUT_W, OUT_H, VERSION };
+module.exports = { classify, compose, titleMask, bandDiff, sampleBand, clean, geometry, Tracker, Hud, writeNew, writeWhole, readSmallJson, mono,
+    BAND, TITLE, OUT_W, OUT_H, VERSION };
 if (require.main === module || bundled) main();

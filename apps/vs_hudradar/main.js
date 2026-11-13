@@ -5,8 +5,10 @@
  * Служба (инструмент «Radar HUD service» из того же источника) читает плитку HUD Speed с дашборда CarPlay
  * и показывает предупреждение на проекции. Это приложение только управляет ею и показывает, что она делает:
  *
- *   настройки  -> /dev/shm/hudradar/control.json   (служба читает и запоминает их у себя)
- *   состояние  <- /dev/shm/hudradar/status.json    (служба пишет раз в секунду)
+ *   настройки  -> /dev/shm/hudradar/control/control.json   (служба читает и запоминает их у себя)
+ *   состояние  <- /dev/shm/hudradar/status.json            (служба пишет раз в секунду)
+ *
+ * Обе папки делает служба. Приложение их не создаёт: нет папки - значит, служба не запущена.
  *
  * Приложению не нужно работать постоянно: служба стартует вместе с головным устройством с последними настройками.
  */
@@ -16,7 +18,7 @@ const mgu = require('./kit/mgu');
 const G = require('./kit/gauges');
 
 const DIR = '/dev/shm/hudradar';
-const CONTROL = path.join(DIR, 'control.json');
+const CONTROL = path.join(DIR, 'control', 'control.json');
 const STATUS = path.join(DIR, 'status.json');
 const W = 1600, H = 520;
 const MODES = ['auto', 'on', 'off'];
@@ -27,6 +29,8 @@ mgu.run({
     async start(ctx) {
         const { ui, settings, log } = ctx;
         let demo = 0, note = '', noteUntil = 0;
+        // the head unit's wall clock is set from GPS and can jump: what is timed here runs on this one
+        const mono = () => { const t = process.hrtime(); return t[0] * 1000 + Math.floor(t[1] / 1e6); };
 
         /** The settings as the service takes them; written whole (a temp file renamed over the old one). */
         function send() {
@@ -45,14 +49,17 @@ mgu.run({
                 return false;
             }
         }
-        /** What the service last said, or null when it is not there or went quiet (older than 5 s). */
+        /** What the service last said, or null when it is not there or went quiet (nothing new for 5 s). */
+        let lastAt = 0, lastAtSeen = 0;
         function status() {
             try {
                 const s = JSON.parse(fs.readFileSync(STATUS, 'utf8'));
-                return (s && Date.now() - fs.statSync(STATUS).mtimeMs < 5000) ? s : null;
+                if (!s || typeof s !== 'object') return null;
+                if (s.at !== lastAt) { lastAt = s.at; lastAtSeen = mono(); }
+                return mono() - lastAtSeen < 5000 ? s : null;
             } catch (e) { return null; }
         }
-        const say = (text) => { note = text; noteUntil = Date.now() + 4000; };
+        const say = (text) => { note = text; noteUntil = mono() + 4000; };
 
         settings.onChange(() => { send(); });
         ui.onClick('BTN_MODE', () => {
@@ -63,7 +70,7 @@ mgu.run({
         });
         ui.onClick('BTN_DEMO', () => {
             demo = Date.now();
-            if (!send()) say('Служба не установлена: пример показать некому');
+            if (!send()) say('Служба не запущена: пример показать некому');
             else if (settings.get('mode') === 'off') say('Режим «Выключено»: пример всё равно покажется на 8 секунд');
             else say('Пример на проекции, 8 секунд');
         });
@@ -74,9 +81,14 @@ mgu.run({
         function headline(s, t) {
             if (!s) {
                 return ['Служба не отвечает', t.crit,
-                    'Установите «Radar HUD service» в MGU Store. Если она стоит, перезапустите головное устройство.'];
+                    'Перезагрузите головное устройство: служба стартует с первого запуска после установки.'];
             }
             if (s.error) return ['Служба не может работать', t.crit, String(s.error)];
+            if (s.hud === 'off') return ['Нет связи с Cluster renderer', t.crit, 'Установите или обновите Cluster renderer в MGU Store.'];
+            if (s.hud === 'disabled') {
+                return ['Проекция отключена защитой', t.crit,
+                    'Cluster renderer отключил вывод на проекцию после сбоев дисплея. Сброс по SSH: cluster-render guard-reset'];
+            }
             if (s.demo) return ['Пример на проекции', t.accent, 'Так выглядит предупреждение с текущими настройками.'];
             if (s.mode === 'off') return ['Выключено', t.dim, 'Предупреждения на проекцию не выводятся. Кнопка «Режим» включает.'];
             if (!s.carplay) {
@@ -84,12 +96,16 @@ mgu.run({
                     'Место в проекции занято. Предупреждения появятся, когда на экране будет дашборд CarPlay.' :
                     'Проекция свободна. Служба включится, когда на экране появится CarPlay.'];
             }
+            if (s.tile === 'alert' && s.hud === 'waiting') {
+                return ['Камера впереди, но место занято', t.warn, 'Проекцию сейчас держит BMW: своя навигация или всплывающее окно.'];
+            }
             if (s.tile === 'alert') return ['Предупреждение на проекции', t.warn, 'HUD Speed показывает камеру.'];
             if (s.tile === 'idle') return ['Готово', '#2fd27a', 'Плитка HUD Speed видна, камер впереди нет.'];
             return ['Не вижу плитку HUD Speed', t.warn,
                 'Откройте дашборд CarPlay (экран с плитками). HUD Speed должен работать на телефоне в фоне.'];
         }
-        const HUD_NAME = { shown: 'занята службой', waiting: 'занята BMW, ждём', hidden: 'свободна', disabled: 'отключена защитой', off: 'нет связи' };
+        const HUD_NAME = { shown: 'занята службой', waiting: 'занята BMW, ждём', starting: 'запрашиваем', hidden: 'свободна',
+            unavailable: 'недоступна', disabled: 'отключена защитой', off: 'нет связи' };
 
         ctx.loop('MAIN', 2, () => {
             const t = ctx.theme(), s = status();
@@ -116,7 +132,7 @@ mgu.run({
             });
             col(rows, 60); col(right, 860);
 
-            if (Date.now() < noteUntil) {
+            if (mono() < noteUntil) {
                 const w = cv.textWidth(note, 28, { font: 'bold' }) + 56;
                 cv.roundRect(W - 60 - w, 98, w, 52, 26, t.accent);
                 cv.text(note, W - 60 - w / 2, 134, 28, t.bg, { font: 'bold', align: 'center' });

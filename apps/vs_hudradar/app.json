@@ -2,7 +2,7 @@
   "id": "vs_hudradar",
   "title": "Radar HUD",
   "description": "Предупреждения о камерах с плитки HUD Speed (дашборд CarPlay) на проекции. Нужна служба Radar HUD service.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "vendor": "custom",
   "loggingId": "OAV1",
   "iconGlyph": "HUD",

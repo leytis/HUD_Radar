@@ -99,7 +99,7 @@ class Maps(object):
     def __init__(self, fd):
         self.fd = fd; self.maps = {}
     def get(self, fb):
-        now = time.time()
+        now = time.monotonic()
         e = self.maps.get(fb)
         if e and now - e[1] < self.TTL: return e[0]
         if e: e[0].close(); del self.maps[fb]
@@ -164,10 +164,10 @@ def main():
         return None
 
     plane = 0; seq = 0; last_sent = None; last_probe = None; last_full = 0.0; black = 0
-    t_read = 0.0; n_read = 0; t_stat = time.time(); sent = 0; fulls = 0; slow = 0
+    t_read = 0.0; n_read = 0; t_stat = time.monotonic(); sent = 0; fulls = 0; slow = 0
     log('hs-cap started, check every %d ms' % (PERIOD * 1000))
     while True:
-        t0 = time.time()
+        t0 = time.monotonic()
         flags = 1; data = b''
         try:
             if not plane:
@@ -198,7 +198,7 @@ def main():
                     elif not stable:
                         flags = 3; last_probe = None             # still changing: look again next time
                     else:
-                        last_full = time.time(); last_probe = probe
+                        last_full = time.monotonic(); last_probe = probe
                         black = 0 if has_picture(a) else black + 1
                         if black > 8: plane = 0; black = 0       # this plane went black: look again
                         if changed(a, last_sent): last_sent = a; data = a; flags = 0; sent += 1
@@ -207,20 +207,20 @@ def main():
         if flags == 2: last_sent = None
         seq += 1
         try:
-            out.write(struct.pack('<4sIII', b'HSF1', seq, int((time.time() - t0) * 10000), flags))
+            out.write(struct.pack('<4sIII', b'HSF1', seq, int((time.monotonic() - t0) * 10000), flags))
             if flags == 0: out.write(data)
             out.flush()
         except (BrokenPipeError, OSError):
             break                                                  # the service is gone
-        dt = time.time() - t0
+        dt = time.monotonic() - t0
         t_read += dt; n_read += 1
-        if time.time() - t_stat > 60:
+        if time.monotonic() - t_stat > 60:
             avg = t_read / n_read * 1000
             log('avg %.1f ms per check, %d whole-tile reads, %d redrawn-while-read retries, %d changed frames in the last minute' % (avg, fulls, st['torn'], sent))
             slow = slow + 1 if avg > 50 else 0
             if slow >= 2:
                 log('checks are too slow for two minutes: stopping, so the head unit is not loaded'); sys.exit(3)
-            t_read = 0.0; n_read = 0; st['torn'] = 0; sent = 0; fulls = 0; t_stat = time.time()
+            t_read = 0.0; n_read = 0; st['torn'] = 0; sent = 0; fulls = 0; t_stat = time.monotonic()
         time.sleep(max(0.02, PERIOD - dt))
 
 if __name__ == '__main__':

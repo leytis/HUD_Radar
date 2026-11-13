@@ -4,11 +4,19 @@
     "path": "apps/*",
     "manifest": "app.json",
     "icon": "icon.png",
-    "mguHmi": ["ID7"],
-    "requires": { "hudradar": "1.0.0" },
+    "mguHmi": [
+      "ID7"
+    ],
+    "requires": {
+      "hudradar": "1.0.1"
+    },
     "build": {
       "python": "kit/tools/build.py",
-      "args": ["--language", "ru", "{id}"],
+      "args": [
+        "--language",
+        "ru",
+        "{id}"
+      ],
       "sdk": "oap-sdk",
       "output": "dist/{id}@{version}.tgz"
     }
@@ -17,16 +25,22 @@
     {
       "id": "hudradar",
       "path": "service/prebuilt",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "title": "Radar HUD service",
       "description": "Переносит предупреждения HUD Speed с дашборда CarPlay на проекцию. Управляется из приложения Radar HUD",
-      "mguHmi": ["ID7"],
-      "requires": { "cluster-render": "0.5.0", "mgu-python": "1.0.0" },
+      "mguHmi": [
+        "ID7"
+      ],
+      "requires": {
+        "cluster-render": "0.5.0",
+        "mgu-python": "1.0.0"
+      },
       "service": {
         "exec": "hudradar",
         "user": "root",
-        "runtimeDirectory": "hudradar",
-        "after": ["cluster-render.socket"]
+        "after": [
+          "cluster-render.socket"
+        ]
       }
     }
   ]

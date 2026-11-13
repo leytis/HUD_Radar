@@ -3,12 +3,12 @@
  * Собирает службу в один исполняемый файл service/prebuilt/hudradar: MGU Store ставит инструмент одним файлом.
  * Внутрь попадают hudradar.js, клиент cluster-render, скрипт чтения экрана и маска заголовка плитки.
  *
- *   node service/build.js
+ *   node service/build.js [куда]
  */
 const fs = require('fs');
 const path = require('path');
 
-const src = path.join(__dirname, 'src'), out = path.join(__dirname, 'prebuilt', 'hudradar');
+const src = path.join(__dirname, 'src'), out = process.argv[2] || path.join(__dirname, 'prebuilt', 'hudradar');
 const read = (n) => fs.readFileSync(path.join(src, n), 'utf8');
 const files = { 'hs-cap.py': read('hs-cap.py'), 'title-mask.b64': read('title-mask.b64').trim() };
 
@@ -24,7 +24,7 @@ const text = '#!/usr/bin/node\n' +
     '};\n' +
     '(function () {\n' + read('hudradar.js') + '\n})();\n';
 
-fs.mkdirSync(path.dirname(out), { recursive: true });
+try { fs.mkdirSync(path.dirname(out)); } catch (e) { /* there */ }
 fs.writeFileSync(out, text);
 fs.chmodSync(out, 0o755);
 console.log(out + ': ' + text.length + ' bytes');

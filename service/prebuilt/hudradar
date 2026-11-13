@@ -3,7 +3,7 @@
 // cluster_render_client.js: MPL-2.0, (C) 2026 Robert Nisipeanu, https://github.com/robertnisipeanu/idrive-apps
 'use strict';
 const __BUNDLE = {
-    files: {"hs-cap.py":"#!/var/opt/mgu-python/current/bin/python3\n\"\"\"\nhs-cap.py - читает из видеопамяти две маленькие области плитки HUD Speed на дашборде CarPlay\nи пишет их в stdout для службы hudradar. Только читает: композитор и экран не трогает.\n\nЗапись в stdout (little-endian):\n  16 байт заголовка: b'HSF1', номер, время этой проверки в десятых долях мс, флаги (0 - кадр с данными, 1 - без изменений, 2 - экран не найден,\n  3 - кадр не удалось прочитать целиком, композитор его перерисовывал)\n  при флаге 0 следом идут пиксели BGRA: заголовок плитки (TITLE), затем полоса с предупреждением (BAND)\n\n  python3 hs-cap.py [период_мс=100]\n\nКаждый период читается только маленькая область PROBE (около 2 мс). Плитка целиком читается, когда PROBE\nизменилась, и отправляется после того, как два чтения подряд совпали: кадр, пойманный посреди смены, не уходит.\n\"\"\"\nimport ctypes, fcntl, mmap, os, struct, sys, time\nfrom operator import sub\n\ndef _ioc(d, nr, size): return (d << 30) | (size << 16) | (0x64 << 8) | nr\ndef IOWR(nr, size): return _ioc(3, nr, size)\ndef IOW(nr, size): return _ioc(1, nr, size)\n\nGETRESOURCES = IOWR(0xA0, 64)\nGETCRTC = IOWR(0xA1, 104)\nGETPLANERES = IOWR(0xB5, 16)\nGETPLANE = IOWR(0xB6, 32)\nGETFB = IOWR(0xAD, 28)\nSET_CLIENT_CAP = IOW(0x0D, 16)\nGEM_CLOSE = IOW(0x09, 8)\nI915_MMAP_GTT = IOWR(0x64, 16)\n\nSCREEN = (1920, 720)\nTILE_X, TILE_Y = 1316, 482                 # плитка на экране\nTITLE = (112, 26, 100, 32)                 # x, y, w, h внутри плитки: буквы \"D Speed\"\nBAND = (60, 96, 488, 100)                  # значки, точки, дистанция\nPROBE = (380, 116, 168, 56)                # дистанция и значок GPS: по этой области видно, что плитка изменилась\nPERIOD = (int(sys.argv[1]) if len(sys.argv) > 1 else 100) / 1000.0\nFULL_EVERY = 2.0                           # с, как часто перечитывать плитку целиком, даже если PROBE не менялась\nSETTLE = 0.04                              # с между двумя чтениями, которые должны совпасть\n\nout = sys.stdout.buffer\ndef log(s):\n    sys.stderr.write('cap: ' + s + '\\n'); sys.stderr.flush()\n\ndef io(fd, req, buf):\n    fcntl.ioctl(fd, req, buf, True)\n    return buf\n\ndef plane_ids(fd):\n    b = bytearray(16); io(fd, GETPLANERES, b)\n    n = struct.unpack_from('I', b, 8)[0]\n    arr = (ctypes.c_uint32 * max(n, 1))()\n    b = bytearray(16)\n    struct.pack_into('Q', b, 0, ctypes.addressof(arr)); struct.pack_into('I', b, 8, n)\n    io(fd, GETPLANERES, b)\n    return list(arr)[:n]\n\ndef plane_fb(fd, pid):\n    p = bytearray(32); struct.pack_into('I', p, 0, pid)\n    io(fd, GETPLANE, p)\n    return struct.unpack_from('I', p, 8)[0]\n\nclass Fb(object):\n    \"\"\"One read of a framebuffer: a handle and a mapping, both released on close.\"\"\"\n    def __init__(self, fd, fb):\n        f = bytearray(28); struct.pack_into('I', f, 0, fb)\n        io(fd, GETFB, f)\n        _, self.w, self.h, self.pitch, self.bpp, _, self.handle = struct.unpack_from('IIIIIII', f, 0)\n        self.fd = fd; self.m = None\n        if not self.handle:\n            raise OSError('no handle for fb %d' % fb)\n        try:\n            if (self.w, self.h) != SCREEN or self.bpp != 32:\n                raise OSError('fb %d is %dx%d/%d' % (fb, self.w, self.h, self.bpp))\n            g = bytearray(16); struct.pack_into('I', g, 0, self.handle)\n            io(fd, I915_MMAP_GTT, g)\n            off = struct.unpack_from('Q', g, 8)[0]\n            self.m = mmap.mmap(fd, (self.pitch * self.h + 4095) & ~4095, mmap.MAP_SHARED, mmap.PROT_READ, offset=off)\n        except Exception:\n            self.close(); raise\n    def region(self, r):\n        x, y, w, h = r\n        m, p = self.m, self.pitch\n        x0 = (TILE_X + x) * 4; n = w * 4\n        return b''.join([m[(TILE_Y + y + i) * p + x0:(TILE_Y + y + i) * p + x0 + n] for i in range(h)])\n    def close(self):\n        if self.m is not None:\n            try: self.m.close()\n            except Exception: pass\n            self.m = None\n        if self.handle:\n            try: io(self.fd, GEM_CLOSE, bytearray(struct.pack('II', self.handle, 0)))\n            except OSError: pass\n            self.handle = 0\n\nclass Maps(object):\n    \"\"\"The framebuffers' mappings, each kept for a short while: the compositor swaps between the same few buffers.\"\"\"\n    TTL = 2.0\n    def __init__(self, fd):\n        self.fd = fd; self.maps = {}\n    def get(self, fb):\n        now = time.time()\n        e = self.maps.get(fb)\n        if e and now - e[1] < self.TTL: return e[0]\n        if e: e[0].close(); del self.maps[fb]\n        for k in [k for k, v in self.maps.items() if now - v[1] >= self.TTL]:\n            self.maps[k][0].close(); del self.maps[k]\n        f = Fb(self.fd, fb)\n        self.maps[fb] = (f, now)\n        return f\n    def clear(self):\n        for v in self.maps.values(): v[0].close()\n        self.maps = {}\n\ndef changed(a, b, step=5, need=5):\n    \"\"\"\n    Two reads differ by more than the video stream's noise (CarPlay is a video: every frame differs a little).\n    Fine enough to tell a digit half way through its cross-fade from the finished one: only one digit of the\n    distance changes between 500 and 400, and it must not be sent, or kept, half faded.\n    \"\"\"\n    if b is None or len(a) != len(b): return True\n    n = 0\n    for d in map(sub, a[0::step], b[0::step]):\n        if d > 26 or d < -26:\n            n += 1\n            if n >= need: return True\n    return False\n\ndef has_picture(data):\n    \"\"\"Not an all-black buffer (the primary plane under the HMI's is black).\"\"\"\n    return any(data[i] or data[i + 1] or data[i + 2] for i in range(0, len(data), 404))\n\ndef find_plane(fd):\n    \"\"\"The plane whose framebuffer is the 1920x720 picture of the centre display (the highest such plane with content).\"\"\"\n    for pid in sorted(plane_ids(fd), reverse=True):\n        try:\n            fb = plane_fb(fd, pid)\n            if not fb: continue\n            f = Fb(fd, fb)\n            try:\n                if has_picture(f.region(BAND)) or has_picture(f.region(TITLE)): return pid\n            finally:\n                f.close()\n        except OSError:\n            continue\n    return 0\n\ndef main():\n    fd = os.open('/dev/dri/card0', os.O_RDWR | os.O_CLOEXEC)\n    try: io(fd, SET_CLIENT_CAP, bytearray(struct.pack('QQ', 2, 1)))\n    except OSError as e: log('universal planes: %s' % e)\n    maps = Maps(fd)\n    st = {'torn': 0}\n\n    def read(regions, plane):\n        \"\"\"The regions from the buffer on screen, or None when it was redrawn under every try. 0 when the plane has no buffer.\"\"\"\n        for attempt in range(3):\n            fb = plane_fb(fd, plane)\n            if not fb: return 0\n            f = maps.get(fb)\n            data = b''.join([f.region(r) for r in regions])\n            if plane_fb(fd, plane) == fb: return data       # the buffer stayed on screen while it was read\n            st['torn'] += 1\n        return None\n\n    plane = 0; seq = 0; last_sent = None; last_probe = None; last_full = 0.0; black = 0\n    t_read = 0.0; n_read = 0; t_stat = time.time(); sent = 0; fulls = 0; slow = 0\n    log('hs-cap started, check every %d ms' % (PERIOD * 1000))\n    while True:\n        t0 = time.time()\n        flags = 1; data = b''\n        try:\n            if not plane:\n                maps.clear()\n                plane = find_plane(fd)\n                if plane: log('plane %d' % plane)\n                last_probe = None\n            if not plane:\n                flags = 2\n            else:\n                probe = read([PROBE], plane)\n                if probe == 0:\n                    plane = 0; maps.clear(); flags = 2\n                elif probe is None:\n                    flags = 3\n                elif changed(probe, last_probe, 5, 3) or t0 - last_full >= FULL_EVERY:\n                    # the tile whole, once two reads in a row agree\n                    a = read([TITLE, BAND], plane); stable = False\n                    for attempt in range(10):\n                        if not a: break\n                        time.sleep(SETTLE)\n                        b = read([TITLE, BAND], plane)\n                        if b and not changed(b, a): a = b; stable = True; break\n                        a = b\n                    fulls += 1\n                    if a == 0:\n                        plane = 0; maps.clear(); flags = 2\n                    elif not stable:\n                        flags = 3; last_probe = None             # still changing: look again next time\n                    else:\n                        last_full = time.time(); last_probe = probe\n                        black = 0 if has_picture(a) else black + 1\n                        if black > 8: plane = 0; black = 0       # this plane went black: look again\n                        if changed(a, last_sent): last_sent = a; data = a; flags = 0; sent += 1\n        except OSError as e:\n            log('read: %s' % e); plane = 0; maps.clear(); flags = 2\n        if flags == 2: last_sent = None\n        seq += 1\n        try:\n            out.write(struct.pack('<4sIII', b'HSF1', seq, int((time.time() - t0) * 10000), flags))\n            if flags == 0: out.write(data)\n            out.flush()\n        except (BrokenPipeError, OSError):\n            break                                                  # the service is gone\n        dt = time.time() - t0\n        t_read += dt; n_read += 1\n        if time.time() - t_stat > 60:\n            avg = t_read / n_read * 1000\n            log('avg %.1f ms per check, %d whole-tile reads, %d redrawn-while-read retries, %d changed frames in the last minute' % (avg, fulls, st['torn'], sent))\n            slow = slow + 1 if avg > 50 else 0\n            if slow >= 2:\n                log('checks are too slow for two minutes: stopping, so the head unit is not loaded'); sys.exit(3)\n            t_read = 0.0; n_read = 0; st['torn'] = 0; sent = 0; fulls = 0; t_stat = time.time()\n        time.sleep(max(0.02, PERIOD - dt))\n\nif __name__ == '__main__':\n    try:\n        main()\n    except KeyboardInterrupt:\n        pass\n","title-mask.b64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAQEBAQEBAQEBAQEBAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAQEBAQEBAAAAAAEBAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAEBAQEBAAAAAAAAAQEBAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAABAQEBAAAAAAAAAAABAQEBAAAAAAABAQEBAAAAAAEBAQEAAAAAAAAAAAAAAAAAAQEBAQEBAAAAAAAAAAAAAAAAAAEBAQEBAQAAAAAAAAAAAAAAAAEBAQEBAAAAAQEBAQAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAQEBAQEBAQEAAAAAAAAAAAABAQEBAQEBAQEBAAAAAAAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAQEBAQEBAQEAAAEBAQEAAAAAAAEBAQEBAAAAAAAAAAAAAAAAAAAAAAEBAQEAAQEBAQEBAQEBAQAAAAAAAAABAQEBAQEBAQEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAAAAAAAAAQEBAQEBAQEBAQABAQEBAAAAAAABAQEBAQEAAAAAAAAAAAAAAAAAAAABAQEBAQEBAQEBAQEBAQEBAAAAAAABAQEBAQEAAAEBAQEBAAAAAAAAAQEBAQEBAAABAQEBAQAAAAAAAAEBAQEBAQEBAQEBAQEBAQAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAAAAAQEBAQEBAAAAAAABAQEBAQAAAAAAAQEBAQAAAAAAAQEBAQEAAAAAAAEBAQEAAAAAAAEBAQEBAAAAAAEBAQEBAQAAAAABAQEBAQEAAAAAAAABAQEBAQEBAQEBAQEBAAAAAAAAAAEBAQEBAAAAAAAAAQEBAQEAAAAAAQEBAQEAAAAAAAABAQEBAAAAAAEBAQEAAAAAAAAAAQEBAQAAAAABAQEBAQAAAAAAAAEBAQEBAAAAAAAAAAEBAQEBAQEBAQEBAQEAAAAAAAABAQEBAQAAAAAAAAABAQEBAAAAAAEBAQEAAAAAAAAAAQEBAQEAAAABAQEBAAAAAAAAAAEBAQEBAAAAAQEBAQAAAAAAAAAAAQEBAQAAAAAAAAAAAAABAQEBAQEBAQEBAQAAAAAAAQEBAQEAAAAAAAAAAQEBAQEAAAABAQEBAQEBAQEBAQEBAQEBAAAAAQEBAQEBAQEBAQEBAQEBAQAAAAEBAQEAAAAAAAAAAAEBAQEAAAAAAAAAAAAAAAAAAAEBAQEBAQEBAAAAAAEBAQEAAAAAAAAAAAEBAQEBAAAAAQEBAQEBAQEBAQEBAQEBAQAAAAEBAQEBAQEBAQEBAQEBAQEAAAABAQEBAAAAAAAAAAABAQEBAAAAAAAAAAAAAAAAAAAAAAABAQEBAQAAAAABAQEBAAAAAAAAAAABAQEBAQAAAAEBAQEBAQEBAQEBAQEBAQEAAAABAQEBAQEBAQEBAQEBAQEBAAAAAQEBAQAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAQEBAQEAAAAAAQEBAQEAAAAAAAAAAQEBAQEAAAABAQEBAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAAEBAQEAAAAAAQEBAQAAAAAAAAAAAAEBAQEBAAAAAAEBAQEBAAAAAAAAAAEBAQEAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAAEBAQEBAAAAAAEBAQEBAAAAAAAAAAABAQEBAQAAAAABAQEBAQAAAAAAAAEBAQEBAAAAAAEBAQEBAAAAAAAAAAAAAAAAAAABAQEBAQAAAAAAAAAAAAAAAAAAAQEBAQEAAAAAAAABAQEBAQAAAAAAAQEBAQEAAAAAAAABAQEBAQAAAAAAAQEBAQEBAAAAAAEBAQEBAQAAAAAAAQEBAQAAAAAAAAEBAQEAAAAAAAEBAQEAAAAAAAABAQEBAAAAAAEBAQEBAQAAAAABAQEBAQEAAAAAAAEBAQEBAQEBAQEBAQEBAQEAAAAAAAEBAQEBAQEBAQEBAQEBAQAAAAAAAAEBAQEBAQEBAQEBAQEBAAAAAAABAQEBAQEBAQEBAQEBAQAAAAAAAQEBAQEBAQEBAQEBAQEBAAAAAAAAAQEBAQEBAQEBAQEBAQEAAAAAAAABAQEBAAEBAQEBAQEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAAAAAAAAAAEBAQEBAQEBAQEBAQAAAAAAAAABAQEBAQEBAQEAAQEBAQAAAAAAAAABAQEBAQEBAQEBAQEAAAAAAAAAAQEBAQAAAQEBAQEBAQEAAAAAAAAAAAABAQEBAQEBAQEBAAAAAAAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAAEBAQEBAQEAAAEBAQEAAAAAAAAAAAAAAQEBAQEBAAAAAAAAAAAAAAEBAQEAAAAAAAEBAAAAAAAAAAAAAAAAAAAAAQEBAAAAAAAAAAAAAAAAAAAAAAEBAQAAAAAAAAAAAAAAAAAAAAEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+    files: {"hs-cap.py":"#!/var/opt/mgu-python/current/bin/python3\n\"\"\"\nhs-cap.py - читает из видеопамяти две маленькие области плитки HUD Speed на дашборде CarPlay\nи пишет их в stdout для службы hudradar. Только читает: композитор и экран не трогает.\n\nЗапись в stdout (little-endian):\n  16 байт заголовка: b'HSF1', номер, время этой проверки в десятых долях мс, флаги (0 - кадр с данными, 1 - без изменений, 2 - экран не найден,\n  3 - кадр не удалось прочитать целиком, композитор его перерисовывал)\n  при флаге 0 следом идут пиксели BGRA: заголовок плитки (TITLE), затем полоса с предупреждением (BAND)\n\n  python3 hs-cap.py [период_мс=100]\n\nКаждый период читается только маленькая область PROBE (около 2 мс). Плитка целиком читается, когда PROBE\nизменилась, и отправляется после того, как два чтения подряд совпали: кадр, пойманный посреди смены, не уходит.\n\"\"\"\nimport ctypes, fcntl, mmap, os, struct, sys, time\nfrom operator import sub\n\ndef _ioc(d, nr, size): return (d << 30) | (size << 16) | (0x64 << 8) | nr\ndef IOWR(nr, size): return _ioc(3, nr, size)\ndef IOW(nr, size): return _ioc(1, nr, size)\n\nGETRESOURCES = IOWR(0xA0, 64)\nGETCRTC = IOWR(0xA1, 104)\nGETPLANERES = IOWR(0xB5, 16)\nGETPLANE = IOWR(0xB6, 32)\nGETFB = IOWR(0xAD, 28)\nSET_CLIENT_CAP = IOW(0x0D, 16)\nGEM_CLOSE = IOW(0x09, 8)\nI915_MMAP_GTT = IOWR(0x64, 16)\n\nSCREEN = (1920, 720)\nTILE_X, TILE_Y = 1316, 482                 # плитка на экране\nTITLE = (112, 26, 100, 32)                 # x, y, w, h внутри плитки: буквы \"D Speed\"\nBAND = (60, 96, 488, 100)                  # значки, точки, дистанция\nPROBE = (380, 116, 168, 56)                # дистанция и значок GPS: по этой области видно, что плитка изменилась\nPERIOD = (int(sys.argv[1]) if len(sys.argv) > 1 else 100) / 1000.0\nFULL_EVERY = 2.0                           # с, как часто перечитывать плитку целиком, даже если PROBE не менялась\nSETTLE = 0.04                              # с между двумя чтениями, которые должны совпасть\n\nout = sys.stdout.buffer\ndef log(s):\n    sys.stderr.write('cap: ' + s + '\\n'); sys.stderr.flush()\n\ndef io(fd, req, buf):\n    fcntl.ioctl(fd, req, buf, True)\n    return buf\n\ndef plane_ids(fd):\n    b = bytearray(16); io(fd, GETPLANERES, b)\n    n = struct.unpack_from('I', b, 8)[0]\n    arr = (ctypes.c_uint32 * max(n, 1))()\n    b = bytearray(16)\n    struct.pack_into('Q', b, 0, ctypes.addressof(arr)); struct.pack_into('I', b, 8, n)\n    io(fd, GETPLANERES, b)\n    return list(arr)[:n]\n\ndef plane_fb(fd, pid):\n    p = bytearray(32); struct.pack_into('I', p, 0, pid)\n    io(fd, GETPLANE, p)\n    return struct.unpack_from('I', p, 8)[0]\n\nclass Fb(object):\n    \"\"\"One read of a framebuffer: a handle and a mapping, both released on close.\"\"\"\n    def __init__(self, fd, fb):\n        f = bytearray(28); struct.pack_into('I', f, 0, fb)\n        io(fd, GETFB, f)\n        _, self.w, self.h, self.pitch, self.bpp, _, self.handle = struct.unpack_from('IIIIIII', f, 0)\n        self.fd = fd; self.m = None\n        if not self.handle:\n            raise OSError('no handle for fb %d' % fb)\n        try:\n            if (self.w, self.h) != SCREEN or self.bpp != 32:\n                raise OSError('fb %d is %dx%d/%d' % (fb, self.w, self.h, self.bpp))\n            g = bytearray(16); struct.pack_into('I', g, 0, self.handle)\n            io(fd, I915_MMAP_GTT, g)\n            off = struct.unpack_from('Q', g, 8)[0]\n            self.m = mmap.mmap(fd, (self.pitch * self.h + 4095) & ~4095, mmap.MAP_SHARED, mmap.PROT_READ, offset=off)\n        except Exception:\n            self.close(); raise\n    def region(self, r):\n        x, y, w, h = r\n        m, p = self.m, self.pitch\n        x0 = (TILE_X + x) * 4; n = w * 4\n        return b''.join([m[(TILE_Y + y + i) * p + x0:(TILE_Y + y + i) * p + x0 + n] for i in range(h)])\n    def close(self):\n        if self.m is not None:\n            try: self.m.close()\n            except Exception: pass\n            self.m = None\n        if self.handle:\n            try: io(self.fd, GEM_CLOSE, bytearray(struct.pack('II', self.handle, 0)))\n            except OSError: pass\n            self.handle = 0\n\nclass Maps(object):\n    \"\"\"The framebuffers' mappings, each kept for a short while: the compositor swaps between the same few buffers.\"\"\"\n    TTL = 2.0\n    def __init__(self, fd):\n        self.fd = fd; self.maps = {}\n    def get(self, fb):\n        now = time.monotonic()\n        e = self.maps.get(fb)\n        if e and now - e[1] < self.TTL: return e[0]\n        if e: e[0].close(); del self.maps[fb]\n        for k in [k for k, v in self.maps.items() if now - v[1] >= self.TTL]:\n            self.maps[k][0].close(); del self.maps[k]\n        f = Fb(self.fd, fb)\n        self.maps[fb] = (f, now)\n        return f\n    def clear(self):\n        for v in self.maps.values(): v[0].close()\n        self.maps = {}\n\ndef changed(a, b, step=5, need=5):\n    \"\"\"\n    Two reads differ by more than the video stream's noise (CarPlay is a video: every frame differs a little).\n    Fine enough to tell a digit half way through its cross-fade from the finished one: only one digit of the\n    distance changes between 500 and 400, and it must not be sent, or kept, half faded.\n    \"\"\"\n    if b is None or len(a) != len(b): return True\n    n = 0\n    for d in map(sub, a[0::step], b[0::step]):\n        if d > 26 or d < -26:\n            n += 1\n            if n >= need: return True\n    return False\n\ndef has_picture(data):\n    \"\"\"Not an all-black buffer (the primary plane under the HMI's is black).\"\"\"\n    return any(data[i] or data[i + 1] or data[i + 2] for i in range(0, len(data), 404))\n\ndef find_plane(fd):\n    \"\"\"The plane whose framebuffer is the 1920x720 picture of the centre display (the highest such plane with content).\"\"\"\n    for pid in sorted(plane_ids(fd), reverse=True):\n        try:\n            fb = plane_fb(fd, pid)\n            if not fb: continue\n            f = Fb(fd, fb)\n            try:\n                if has_picture(f.region(BAND)) or has_picture(f.region(TITLE)): return pid\n            finally:\n                f.close()\n        except OSError:\n            continue\n    return 0\n\ndef main():\n    fd = os.open('/dev/dri/card0', os.O_RDWR | os.O_CLOEXEC)\n    try: io(fd, SET_CLIENT_CAP, bytearray(struct.pack('QQ', 2, 1)))\n    except OSError as e: log('universal planes: %s' % e)\n    maps = Maps(fd)\n    st = {'torn': 0}\n\n    def read(regions, plane):\n        \"\"\"The regions from the buffer on screen, or None when it was redrawn under every try. 0 when the plane has no buffer.\"\"\"\n        for attempt in range(3):\n            fb = plane_fb(fd, plane)\n            if not fb: return 0\n            f = maps.get(fb)\n            data = b''.join([f.region(r) for r in regions])\n            if plane_fb(fd, plane) == fb: return data       # the buffer stayed on screen while it was read\n            st['torn'] += 1\n        return None\n\n    plane = 0; seq = 0; last_sent = None; last_probe = None; last_full = 0.0; black = 0\n    t_read = 0.0; n_read = 0; t_stat = time.monotonic(); sent = 0; fulls = 0; slow = 0\n    log('hs-cap started, check every %d ms' % (PERIOD * 1000))\n    while True:\n        t0 = time.monotonic()\n        flags = 1; data = b''\n        try:\n            if not plane:\n                maps.clear()\n                plane = find_plane(fd)\n                if plane: log('plane %d' % plane)\n                last_probe = None\n            if not plane:\n                flags = 2\n            else:\n                probe = read([PROBE], plane)\n                if probe == 0:\n                    plane = 0; maps.clear(); flags = 2\n                elif probe is None:\n                    flags = 3\n                elif changed(probe, last_probe, 5, 3) or t0 - last_full >= FULL_EVERY:\n                    # the tile whole, once two reads in a row agree\n                    a = read([TITLE, BAND], plane); stable = False\n                    for attempt in range(10):\n                        if not a: break\n                        time.sleep(SETTLE)\n                        b = read([TITLE, BAND], plane)\n                        if b and not changed(b, a): a = b; stable = True; break\n                        a = b\n                    fulls += 1\n                    if a == 0:\n                        plane = 0; maps.clear(); flags = 2\n                    elif not stable:\n                        flags = 3; last_probe = None             # still changing: look again next time\n                    else:\n                        last_full = time.monotonic(); last_probe = probe\n                        black = 0 if has_picture(a) else black + 1\n                        if black > 8: plane = 0; black = 0       # this plane went black: look again\n                        if changed(a, last_sent): last_sent = a; data = a; flags = 0; sent += 1\n        except OSError as e:\n            log('read: %s' % e); plane = 0; maps.clear(); flags = 2\n        if flags == 2: last_sent = None\n        seq += 1\n        try:\n            out.write(struct.pack('<4sIII', b'HSF1', seq, int((time.monotonic() - t0) * 10000), flags))\n            if flags == 0: out.write(data)\n            out.flush()\n        except (BrokenPipeError, OSError):\n            break                                                  # the service is gone\n        dt = time.monotonic() - t0\n        t_read += dt; n_read += 1\n        if time.monotonic() - t_stat > 60:\n            avg = t_read / n_read * 1000\n            log('avg %.1f ms per check, %d whole-tile reads, %d redrawn-while-read retries, %d changed frames in the last minute' % (avg, fulls, st['torn'], sent))\n            slow = slow + 1 if avg > 50 else 0\n            if slow >= 2:\n                log('checks are too slow for two minutes: stopping, so the head unit is not loaded'); sys.exit(3)\n            t_read = 0.0; n_read = 0; st['torn'] = 0; sent = 0; fulls = 0; t_stat = time.monotonic()\n        time.sleep(max(0.02, PERIOD - dt))\n\nif __name__ == '__main__':\n    try:\n        main()\n    except KeyboardInterrupt:\n        pass\n","title-mask.b64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAQEBAQEBAQEBAQEBAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAQEBAQEBAAAAAAEBAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAEBAQEBAAAAAAAAAQEBAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAABAQEBAAAAAAAAAAABAQEBAAAAAAABAQEBAAAAAAEBAQEAAAAAAAAAAAAAAAAAAQEBAQEBAAAAAAAAAAAAAAAAAAEBAQEBAQAAAAAAAAAAAAAAAAEBAQEBAAAAAQEBAQAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAQEBAQEBAQEAAAAAAAAAAAABAQEBAQEBAQEBAAAAAAAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAQEBAQEBAQEAAAEBAQEAAAAAAAEBAQEBAAAAAAAAAAAAAAAAAAAAAAEBAQEAAQEBAQEBAQEBAQAAAAAAAAABAQEBAQEBAQEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAAAAAAAAAQEBAQEBAQEBAQABAQEBAAAAAAABAQEBAQEAAAAAAAAAAAAAAAAAAAABAQEBAQEBAQEBAQEBAQEBAAAAAAABAQEBAQEAAAEBAQEBAAAAAAAAAQEBAQEBAAABAQEBAQAAAAAAAAEBAQEBAQEBAQEBAQEBAQAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAAAAAQEBAQEBAAAAAAABAQEBAQAAAAAAAQEBAQAAAAAAAQEBAQEAAAAAAAEBAQEAAAAAAAEBAQEBAAAAAAEBAQEBAQAAAAABAQEBAQEAAAAAAAABAQEBAQEBAQEBAQEBAAAAAAAAAAEBAQEBAAAAAAAAAQEBAQEAAAAAAQEBAQEAAAAAAAABAQEBAAAAAAEBAQEAAAAAAAAAAQEBAQAAAAABAQEBAQAAAAAAAAEBAQEBAAAAAAAAAAEBAQEBAQEBAQEBAQEAAAAAAAABAQEBAQAAAAAAAAABAQEBAAAAAAEBAQEAAAAAAAAAAQEBAQEAAAABAQEBAAAAAAAAAAEBAQEBAAAAAQEBAQAAAAAAAAAAAQEBAQAAAAAAAAAAAAABAQEBAQEBAQEBAQAAAAAAAQEBAQEAAAAAAAAAAQEBAQEAAAABAQEBAQEBAQEBAQEBAQEBAAAAAQEBAQEBAQEBAQEBAQEBAQAAAAEBAQEAAAAAAAAAAAEBAQEAAAAAAAAAAAAAAAAAAAEBAQEBAQEBAAAAAAEBAQEAAAAAAAAAAAEBAQEBAAAAAQEBAQEBAQEBAQEBAQEBAQAAAAEBAQEBAQEBAQEBAQEBAQEAAAABAQEBAAAAAAAAAAABAQEBAAAAAAAAAAAAAAAAAAAAAAABAQEBAQAAAAABAQEBAAAAAAAAAAABAQEBAQAAAAEBAQEBAQEBAQEBAQEBAQEAAAABAQEBAQEBAQEBAQEBAQEBAAAAAQEBAQAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAQEBAQEAAAAAAQEBAQEAAAAAAAAAAQEBAQEAAAABAQEBAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAAEBAQEAAAAAAQEBAQAAAAAAAAAAAAEBAQEBAAAAAAEBAQEBAAAAAAAAAAEBAQEAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAAEBAQEBAAAAAAEBAQEBAAAAAAAAAAABAQEBAQAAAAABAQEBAQAAAAAAAAEBAQEBAAAAAAEBAQEBAAAAAAAAAAAAAAAAAAABAQEBAQAAAAAAAAAAAAAAAAAAAQEBAQEAAAAAAAABAQEBAQAAAAAAAQEBAQEAAAAAAAABAQEBAQAAAAAAAQEBAQEBAAAAAAEBAQEBAQAAAAAAAQEBAQAAAAAAAAEBAQEAAAAAAAEBAQEAAAAAAAABAQEBAAAAAAEBAQEBAQAAAAABAQEBAQEAAAAAAAEBAQEBAQEBAQEBAQEBAQEAAAAAAAEBAQEBAQEBAQEBAQEBAQAAAAAAAAEBAQEBAQEBAQEBAQEBAAAAAAABAQEBAQEBAQEBAQEBAQAAAAAAAQEBAQEBAQEBAQEBAQEBAAAAAAAAAQEBAQEBAQEBAQEBAQEAAAAAAAABAQEBAAEBAQEBAQEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAAAAAAAAAAEBAQEBAQEBAQEBAQAAAAAAAAABAQEBAQEBAQEAAQEBAQAAAAAAAAABAQEBAQEBAQEBAQEAAAAAAAAAAQEBAQAAAQEBAQEBAQEAAAAAAAAAAAABAQEBAQEBAQEBAAAAAAAAAAAAAQEBAQEBAQEBAQAAAAAAAAAAAAEBAQEBAQEAAAEBAQEAAAAAAAAAAAAAAQEBAQEBAAAAAAAAAAAAAAEBAQEAAAAAAAEBAAAAAAAAAAAAAAAAAAAAAQEBAAAAAAAAAAAAAAAAAAAAAAEBAQAAAAAAAAAAAAAAAAAAAAEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
     clusterRender: function () { const module = { exports: {} }; (function (module, exports) {
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 Robert Nisipeanu
@@ -557,12 +557,18 @@ module.exports = { ClusterRender, DEFAULT_PATH };
  *   Цифры не распознаются: картинка переносится как есть. База камер остаётся в приложении HUD Speed.
  *
  * Управление (приложение Radar HUD):
- *   /dev/shm/hudradar/control.json   настройки от приложения: { mode, show, size, pos, bright, demo }
- *   /dev/shm/hudradar/status.json    что служба делает сейчас, раз в секунду
+ *   /dev/shm/hudradar/control/control.json   настройки от приложения: { mode, show, size, pos, bright, demo }
+ *   /dev/shm/hudradar/status.json            что служба делает сейчас, раз в секунду
  *   <state>/config.json              последние настройки: с ними служба стартует, пока приложение не запущено
  *
  * Режимы: auto - место в проекции занято, пока на экране CarPlay; on - всегда; off - служба ничего не показывает
  * и экран не читает.
+ *
+ * Служба работает от root, а приложения на головном устройстве нет. Поэтому в папку, куда пишут приложения,
+ * она сама ничего не пишет, а читает оттуда только небольшой обычный файл.
+ *
+ * Все отсчёты времени идут по монотонным часам: обычные головное устройство переводит по GPS, и они могут
+ * прыгнуть назад.
  *
  * Служба никогда не завершается сама: её перезапускает systemd, а частые перезапуски он считает сбоем.
  * Node 8. В репозитории это исходник; в Store ставится один файл, собранный service/build.js.
@@ -571,7 +577,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 
 /* ---------- ресурсы: в собранном файле они внутри него, при запуске из исходников лежат рядом ---------- */
 /* global __BUNDLE */
@@ -581,7 +587,6 @@ function clusterRenderClient() { return bundled ? __BUNDLE.clusterRender() : req
 
 const SHM = process.env.HR_SHM || '/dev/shm/hudradar';
 const STATE = process.env.HR_STATE || '/var/opt/hudradar/state';
-const RUN = process.env.HR_RUN || process.env.RUNTIME_DIRECTORY || '/run/hudradar';
 const PYTHON = process.env.HR_PYTHON || '/var/opt/mgu-python/current/bin/python3';
 const CR_SOCKET = process.env.HR_CR_SOCKET || '/dev/shm/cluster-render/render.sock';
 
@@ -605,7 +610,12 @@ const ON_MS = 200;             // предупреждение должно пр
 const OFF_MS = 1500;           // и столько плитка должна быть пустой, прежде чем оно уйдёт
 const DEMO_MS = 8000;
 
+const HOLD_OFF_MS = 5000;      // CarPlay ушёл с экрана: столько ещё держим место (короткий заход в меню BMW его не отдаёт)
+const REMAKE_MS = [5000, 60000];   // слой отвергнут: когда пробовать снова
+
 function log(s) { process.stdout.write(s + '\n'); }
+/** Milliseconds on a clock that never jumps (the head unit's wall clock is set from GPS). */
+function mono() { const t = process.hrtime(); return t[0] * 1000 + Math.floor(t[1] / 1e6); }
 
 /* ---------- что на плитке ---------- */
 function count(buf, bw, r, pred) {
@@ -738,7 +748,8 @@ const CLAIM_DIR = '/dev/shm/mgu-hud', CLAIM_ID = 'hudradar';
 class Hud {
     constructor() {
         this.cr = null; this.layer = 0; this.geo = null; this.hold = false; this.image = null;
-        this.visible = false; this.target = ''; this.disabled = false; this.claimTimer = null;
+        this.visible = false; this.target = ''; this.holder = ''; this.disabled = false; this.claimTimer = null;
+        this.remakeTimer = null; this.remakes = 0;
         this.blank = Buffer.alloc(OUT_W * OUT_H * 4);
     }
     start() {
@@ -746,18 +757,26 @@ class Hud {
         const cr = this.cr = new ClusterRender(CLAIM_ID, CR_SOCKET);
         cr.on('ready', () => {
             log('hud: connected to cluster-render (' + cr.backend + ')');
-            if (!this.layer && this.geo) this._make();
+            if (!this.layer && this.geo && !this.remakeTimer) this._make();
             this._apply(true);
         });
         cr.on('disconnected', () => { this.target = ''; log('hud: cluster-render went away, reconnecting'); });
         cr.on('target', (name, state, holder, reason, guideDisabled, disabled) => {
             if (name !== 'hud') return;
             const was = this.target + (this.disabled ? '!' : '');
-            this.target = state; this.disabled = !!disabled;
+            this.target = state; this.holder = holder || ''; this.disabled = !!disabled;
             const now = state + (disabled ? '!' : '');
             if (now !== was) log('hud: target ' + (disabled ? 'disabled by the mapping guard' : state + (holder ? ' behind ' + holder : '')));
         });
-        cr.on('refused', (op, ref, reason) => log('hud: refused ' + op + ' ' + ref + ': ' + reason));
+        cr.on('layer', (ref, state, reason) => {
+            if (ref !== this.layer) return;
+            if (state === 'error') { log('hud: layer error' + (reason ? ' (' + reason + ')' : '')); this._remake(); }
+            else if (state === 'shown') this.remakes = 0;
+        });
+        cr.on('refused', (op, ref, reason) => {
+            log('hud: refused ' + op + ' ' + ref + ': ' + reason);
+            if (ref && ref === this.layer && op === 'layer') this._remake();
+        });
         cr.on('error', (e) => log('hud: ' + (e && e.message)));
         cr.connect();
     }
@@ -767,11 +786,23 @@ class Hud {
             fps: 15, visible: false, opacity: g.opacity, sampling: 'bilinear' });
         this.visible = false;
     }
+    /** The renderer refused the layer: drop it and make it again later (5 s, then once a minute). */
+    _remake() {
+        if (this.remakeTimer || !this.cr) return;
+        try { if (this.layer) this.cr.drop(this.layer); } catch (e) { /* gone with the connection */ }
+        this.layer = 0; this.visible = false; this._claim(false);
+        const wait = REMAKE_MS[Math.min(this.remakes++, REMAKE_MS.length - 1)];
+        this.remakeTimer = setTimeout(() => {
+            this.remakeTimer = null;
+            if (!this.cr || !this.cr.ready || this.layer || !this.geo) return;
+            this._make(); this._apply(true);
+        }, wait);
+    }
     /** Where and how bright: { x, y, w, h, opacity }. */
     configure(geo) {
         this.geo = geo;
         if (!this.cr || !this.cr.ready) return;
-        if (!this.layer) this._make(); else this.cr.set(this.layer, geo);
+        if (this.layer) this.cr.set(this.layer, geo); else if (!this.remakeTimer) this._make();
     }
     /** hold: keep the slot on the glass all the time (a clear picture when there is nothing to show). */
     setHold(on) { if (this.hold !== on) { this.hold = on; this._apply(false); } }
@@ -783,14 +814,22 @@ class Hud {
         if (want && (pixels || !this.visible)) this.cr.pixels(this.layer, null, this.image || this.blank);
         if (want !== this.visible) { this.cr.set(this.layer, { visible: want }); this.visible = want; this._claim(want); }
     }
-    /** For the status file: shown | waiting (BMW has the slot) | hidden | disabled (the mapping guard) | off. */
+    /**
+     * For the status file: shown | waiting (BMW's own content has the slot: parked behind it, or giving way to a
+     * pop-up) | starting | hidden (nothing asked for) | unavailable | disabled (the mapping guard) | off (no renderer).
+     */
     state() {
         if (!this.cr || !this.cr.ready) return 'off';
         if (this.disabled) return 'disabled';
+        if (!this.layer) return 'unavailable';
         if (!this.visible) return 'hidden';
-        return this.target === 'shown' ? 'shown' : this.target === 'waiting' ? 'waiting' : 'hidden';
+        if (this.target === 'shown' || this.target === 'lingering') return 'shown';
+        if (this.target === 'parked' || this.target === 'waiting') return 'waiting';
+        if (this.target === 'unavailable') return 'unavailable';
+        return 'starting';
     }
     stop() {
+        if (this.remakeTimer) { clearTimeout(this.remakeTimer); this.remakeTimer = null; }
         this.hold = false; this.image = null; this._apply(false); this._claim(false);
         if (this.cr) { try { if (this.layer) this.cr.drop(this.layer); this.cr.removeAllListeners(); this.cr.close(); } catch (e) { /* closing */ } this.cr = null; }
     }
@@ -799,8 +838,8 @@ class Hud {
         const touch = (held) => {
             try {
                 try { fs.mkdirSync(CLAIM_DIR); fs.chmodSync(CLAIM_DIR, 0o1777); } catch (e) { /* there */ }
-                const f = path.join(CLAIM_DIR, CLAIM_ID), tmp = f + '.' + process.pid + '.tmp';
-                fs.writeFileSync(tmp, JSON.stringify({ held: held, at: Date.now() }) + '\n'); fs.renameSync(tmp, f);
+                const f = path.join(CLAIM_DIR, CLAIM_ID), tmp = f + '.' + process.pid + '.tmp';   // .tmp: the others skip it
+                writeNew(tmp, JSON.stringify({ held: held, at: Date.now() }) + '\n'); fs.renameSync(tmp, f);
             } catch (e) { /* no tmpfs */ }
         };
         if (this.claimTimer) { clearInterval(this.claimTimer); this.claimTimer = null; }
@@ -840,7 +879,7 @@ class Tracker {
     _commit(p) {
         const st = p.info.state;
         if (st === 'alert') {
-            const now = Date.now();
+            const now = mono();
             this.idleSince = 0;
             if (this.state !== 'alert') {
                 if (!this.candSince) this.candSince = now;
@@ -864,7 +903,7 @@ class Tracker {
         this.candSince = 0;
         if (st === 'idle') {
             if (this.state === 'alert') {
-                const now = Date.now();
+                const now = mono();
                 if (!this.idleSince) this.idleSince = now;
                 if (now - this.idleSince < OFF_MS) return;
                 log('alert off');
@@ -879,7 +918,7 @@ class Tracker {
         this.unknownLogged = false;
     }
     _tick() {
-        const now = Date.now();
+        const now = mono();
         if (this.state === 'alert' && this.unknownLogged && now - this.lastAlertAt > HOLD_MS) {
             log('alert dropped: the tile stayed hidden');
             this.state = 'unknown'; this.keptLeft = null; this.shownBand = null; this.unknownLogged = false;
@@ -907,7 +946,26 @@ function clean(c) {
     return o;
 }
 function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; } }
-function writeWhole(file, text) { const tmp = file + '.' + process.pid + '.tmp'; fs.writeFileSync(tmp, text); fs.renameSync(tmp, file); }
+/**
+ * A new file, never through a link: this runs as root and some folders it writes in are open to every app, where a
+ * link left under the name would send the write anywhere.
+ */
+function writeNew(file, data) {
+    try { fs.unlinkSync(file); } catch (e) { /* none */ }
+    const fd = fs.openSync(file, 'wx', 0o644);             // O_EXCL: fails on anything there, a link included
+    const b = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
+    try { fs.writeSync(fd, b, 0, b.length); } finally { fs.closeSync(fd); }
+}
+/** A file written whole or not at all: a new file renamed over the old one. */
+function writeWhole(file, data) { const tmp = file + '.' + process.pid + '.tmp'; writeNew(tmp, data); fs.renameSync(tmp, file); }
+/** A small plain file's JSON, or null: what an app left for us is read only if it is that (no link, no pipe). */
+function readSmallJson(file) {
+    try {
+        const st = fs.lstatSync(file);
+        if (!st.isFile() || st.size > 4096) return null;
+        return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (e) { return null; }
+}
 function geometry(cfg) {
     const k = cfg.size / 100, w = Math.round(OUT_W * k), h = Math.round(OUT_H * k);
     return { x: Math.round((SCENE_W - w) / 2), y: Math.round(CENTRE_Y + cfg.pos - h / 2), w: w, h: h, opacity: Math.round(cfg.bright) / 100 };
@@ -939,21 +997,35 @@ function carplayOnScreen() {
 /* ---------- служба ---------- */
 function main() {
     log('hudradar ' + VERSION + (bundled ? '' : ' (from source)'));
-    try { fs.mkdirSync(SHM); } catch (e) { /* there */ }
-    try { fs.chmodSync(SHM, 0o1777); } catch (e) { log('shm: ' + e.message); }     // the app (its own user) writes control.json here
-    [STATE, RUN].forEach((d) => { try { fs.mkdirSync(d); } catch (e) { /* there, or its parent is missing */ } });
-    const CONTROL = path.join(SHM, 'control.json'), STATUS = path.join(SHM, 'status.json');
+    /*
+     * SHM is ours alone (root, 0755): the status file. SHM/control is open to every app (1777, as /tmp): the app
+     * leaves its settings there. An app that ran before us may have made SHM itself: it is taken over.
+     */
+    const CONTROL_DIR = path.join(SHM, 'control');
+    const CONTROL = path.join(CONTROL_DIR, 'control.json'), STATUS = path.join(SHM, 'status.json');
     const CONFIG = path.join(STATE, 'config.json'), LAST = path.join(STATE, 'last-band.bin');
+    const folder = (dir, mode) => {
+        try { fs.mkdirSync(dir); } catch (e) { /* there */ }
+        try {
+            if (fs.lstatSync(dir).isSymbolicLink()) { fs.unlinkSync(dir); fs.mkdirSync(dir); }
+            if (process.getuid && process.getuid() === 0) fs.chownSync(dir, 0, 0);
+            fs.chmodSync(dir, mode);
+        } catch (e) { log('folder ' + dir + ': ' + e.message); }
+    };
+    folder(SHM, 0o755); folder(CONTROL_DIR, 0o1777);
+    try { fs.mkdirSync(STATE); } catch (e) { /* there, or its parent is missing */ }
 
     const refMask = Buffer.from(resource('title-mask.b64').trim(), 'base64');
     let cfg = clean(readJson(CONFIG));
-    let error = '', carplay = false, capture = null, restarts = 0, retryAt = 0, stopping = false;
-    let demoSeen = 0, demoUntil = 0, alertImage = null, checkMs = 0;
-    const started = Date.now();
+    let error = '', carplay = false, carplaySeenAt = -1e9, capture = null, restarts = 0, retryAt = 0, stopping = false;
+    let demoUntil = 0, alertImage = null, checkMs = 0;
+    // a request for the example left from before this start is not one to show now
+    const before = readSmallJson(CONTROL);
+    let demoSeen = before && Number(before.demo) || 0;
 
     const hud = new Hud();
     const present = () => {                    // what goes on the glass: the example while it runs, else the warning
-        if (Date.now() < demoUntil) return;
+        if (mono() < demoUntil) return;
         hud.show(cfg.mode === 'off' ? null : alertImage);
     };
     const tracker = new Tracker(refMask, (image) => { alertImage = image; present(); }, (band) => {
@@ -964,23 +1036,23 @@ function main() {
     hud.configure(geometry(cfg));
     try { hud.start(); } catch (e) { error = 'Не установлен Cluster renderer из MGU Store'; log('hud: ' + e.message); }
 
-    /* --- захват --- */
-    let capPath = '';
-    try { capPath = path.join(RUN, 'hs-cap.py'); fs.writeFileSync(capPath, resource('hs-cap.py')); }
-    catch (e) { try { capPath = path.join(SHM, 'hs-cap.py'); fs.writeFileSync(capPath, resource('hs-cap.py')); } catch (e2) { log('capture script: ' + e2.message); } }
+    /* --- захват: скрипт идёт интерпретатору аргументом, файла на диске у него нет --- */
+    const capScript = resource('hs-cap.py');
     function startCapture() {
-        if (!fs.existsSync(PYTHON)) { error = 'Не установлен Python (mgu-python) из MGU Store'; return; }
-        const child = capture = spawn(PYTHON, [capPath, process.env.HR_PERIOD || '100'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        if (!fs.existsSync(PYTHON)) { error = 'Не установлен Python (mgu-python) из MGU Store'; retryAt = mono() + 30000; return; }
+        const child = capture = spawn(PYTHON, ['-c', capScript, process.env.HR_PERIOD || '100'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        const startedAt = mono();
         let buf = Buffer.alloc(0), sum = 0, n = 0;
         child.stdout.on('data', (d) => {
             buf = buf.length ? Buffer.concat([buf, d]) : d;
             for (;;) {
                 if (buf.length < 16) break;
-                if (buf.toString('latin1', 0, 4) !== 'HSF1') { log('capture: stream out of step'); child.kill(); return; }
+                if (buf.toString('latin1', 0, 4) !== 'HSF1') { log('capture: stream out of step'); buf = Buffer.alloc(0); child.kill(); return; }
                 const flags = buf.readUInt32LE(12), need = 16 + (flags === 0 ? TITLE_BYTES + BAND_BYTES : 0);
                 if (buf.length < need) break;
                 sum += buf.readUInt32LE(8) / 10; n++;
                 if (n >= 20) { checkMs = Math.round(sum / n * 10) / 10; sum = 0; n = 0; }
+                if (error && error.indexOf('Python') >= 0) error = '';
                 if (flags === 0) tracker.frame(buf.slice(16, 16 + TITLE_BYTES), buf.slice(16 + TITLE_BYTES, need));
                 else if (flags === 1) tracker.same();
                 else if (flags === 2) tracker.lost();              // 3: the frame was being redrawn, nothing learnt
@@ -994,9 +1066,10 @@ function main() {
             if (capture === child) capture = null;
             tracker.reset(); checkMs = 0;
             log('capture exited (' + (sig || code) + ')');
-            if (code === 3) { error = 'Чтение экрана слишком нагружает головное устройство: пауза 10 минут'; retryAt = Date.now() + 600000; }
-            else if (++restarts > 30) { error = 'Чтение экрана не запускается: пауза 10 минут'; retryAt = Date.now() + 600000; restarts = 0; }
-            else retryAt = Date.now() + 5000;
+            if (mono() - startedAt > 600000) restarts = 0;          // it had run well: an exit now is a new story
+            if (code === 3) { error = 'Чтение экрана слишком нагружает головное устройство: пауза 10 минут'; retryAt = mono() + 600000; }
+            else if (++restarts > 30) { error = 'Чтение экрана не запускается: пауза 10 минут'; retryAt = mono() + 600000; restarts = 0; }
+            else retryAt = mono() + 5000;
         });
     }
     /** Stop reading the display (the mode, or CarPlay left it). The next start reads the tile afresh. */
@@ -1012,21 +1085,23 @@ function main() {
         let band = null;
         try { const b = fs.readFileSync(LAST); if (b.length === BAND_BYTES) band = b; } catch (e) { /* none kept yet */ }
         if (!band) band = sampleBand();
-        demoUntil = Date.now() + DEMO_MS;
+        demoUntil = mono() + DEMO_MS;
         hud.show(compose(band, true, null, cfg.show).image);
         log('example on the glass');
-        setTimeout(() => { if (Date.now() >= demoUntil) { demoUntil = 0; present(); } }, DEMO_MS + 50);
+        setTimeout(() => { if (mono() >= demoUntil) { demoUntil = 0; present(); } }, DEMO_MS + 50);
     }
 
     /* --- раз в полсекунды: настройки, CarPlay, что должно работать --- */
-    let controlMtime = 0, lastCarplayCheck = 0, lastStatus = 0;
+    let controlStamp = '', lastCarplayCheck = -1e9, lastStatus = -1e9;
     function tick() {
-        const now = Date.now();
-        try {
-            const m = fs.statSync(CONTROL).mtimeMs;
-            if (m !== controlMtime) {
-                controlMtime = m;
-                const raw = readJson(CONTROL), next = clean(raw);
+        const now = mono();
+        let stamp = '';
+        try { const st = fs.lstatSync(CONTROL); stamp = st.ino + ':' + st.mtimeMs + ':' + st.size; } catch (e) { /* the app has not run since the start */ }
+        if (stamp && stamp !== controlStamp) {
+            controlStamp = stamp;
+            const raw = readSmallJson(CONTROL);
+            if (raw && typeof raw === 'object') {
+                const next = clean(raw);
                 if (JSON.stringify(next) !== JSON.stringify(cfg)) {
                     log('settings ' + JSON.stringify(next));
                     cfg = next;
@@ -1034,48 +1109,59 @@ function main() {
                     try { writeWhole(CONFIG, JSON.stringify(cfg) + '\n'); } catch (e) { log('config: ' + e.message); }
                     present();
                 }
-                const d = raw && Number(raw.demo) || 0;
-                if (d && d !== demoSeen) { const first = demoSeen === 0 && now - started < 3000 && now - d > 10000; demoSeen = d; if (!first) demo(); }
+                const d = Number(raw.demo) || 0;
+                if (d && d !== demoSeen) { demoSeen = d; demo(); }
             }
-        } catch (e) { /* no control file: the app has not run since the start */ }
+        }
 
-        if (now - lastCarplayCheck >= 1500) { lastCarplayCheck = now; const c = carplayOnScreen(); if (c !== carplay) { carplay = c; log('carplay ' + (c ? 'on' : 'off') + ' the display'); } }
+        if (now - lastCarplayCheck >= 1500) {
+            lastCarplayCheck = now;
+            const c = carplayOnScreen();
+            if (c !== carplay) { carplay = c; log('carplay ' + (c ? 'on' : 'off') + ' the display'); }
+            if (c) carplaySeenAt = now;
+        }
         const demoOn = now < demoUntil;
-        hud.setHold(demoOn || cfg.mode === 'on' || (cfg.mode === 'auto' && carplay));
-        const read = cfg.mode === 'on' || (cfg.mode === 'auto' && carplay);          // read the display at all?
-        if (read) {
-            if (!capture && now >= retryAt && capPath) { if (retryAt && error.indexOf('пауза') >= 0) error = ''; startCapture(); }
+        /*
+         * Auto keeps the slot a little after CarPlay leaves the display: a look into BMW's menu and back does not
+         * hand it over. Each hand-over is a new mapping for the cluster, and with BMW's route running ours waits
+         * behind its card afterwards (cluster-render's README, "Arbitration").
+         */
+        hud.setHold(demoOn || cfg.mode === 'on' || (cfg.mode === 'auto' && (carplay || now - carplaySeenAt < HOLD_OFF_MS)));
+        if (cfg.mode === 'on' || (cfg.mode === 'auto' && carplay)) {            // read the display at all?
+            if (!capture && now >= retryAt) { if (error.indexOf('пауза') >= 0) error = ''; startCapture(); }
         } else stopCapture();
 
         if (now - lastStatus >= 1000) {
             lastStatus = now;
             const st = {
                 version: VERSION, mode: cfg.mode, show: cfg.show, carplay: carplay,
-                tile: tracker.state === 'none' ? 'unknown' : tracker.state, hud: hud.state(), demo: demoOn,
+                tile: tracker.state === 'none' ? 'unknown' : tracker.state, hud: hud.state(), holder: hud.holder, demo: demoOn,
                 alerts: tracker.stats.alerts, pictures: tracker.stats.pictures, checkMs: capture ? checkMs : 0,
-                error: error, at: now,
+                error: error, at: Date.now(),
             };
-            try { writeWhole(STATUS, JSON.stringify(st) + '\n'); fs.chmodSync(STATUS, 0o644); } catch (e) { /* no tmpfs */ }
+            try { writeWhole(STATUS, JSON.stringify(st) + '\n'); } catch (e) { /* no tmpfs */ }
         }
     }
     setInterval(() => { try { tick(); } catch (e) { log('tick: ' + (e && e.stack || e)); } }, 500);
     setInterval(() => log('alive: mode ' + cfg.mode + ', carplay ' + (carplay ? 'on' : 'off') + ', tile ' + tracker.state + ', hud ' + hud.state() +
-        ', ' + tracker.stats.alerts + ' alerts, ' + tracker.stats.pictures + ' pictures, check ' + checkMs + ' ms'), 300000);
+        ', ' + tracker.stats.alerts + ' alerts, ' + tracker.stats.pictures + ' pictures, check ' + checkMs + ' ms'), 600000);
 
     const finish = () => {                                            // systemd stops the service: leave cleanly
         if (stopping) return; stopping = true;
         log('stopping');
         if (capture) { try { capture.kill(); } catch (e) { /* gone */ } }
-        hud.stop();
+        try { hud.stop(); } catch (e) { /* the renderer is gone */ }
         try { fs.unlinkSync(STATUS); } catch (e) { /* none */ }
         setTimeout(() => process.exit(0), 300);
     };
     process.on('SIGINT', finish); process.on('SIGTERM', finish);
-    // any other trouble is logged and lived through: an exit would have systemd restart the service over and over
+    // any other trouble is logged and lived through: an exit would only have systemd start the service again
     process.on('uncaughtException', (e) => { log('error: ' + (e && e.stack || e)); });
+    process.on('unhandledRejection', (e) => { log('error: ' + (e && e.stack || e)); });
 }
 
-module.exports = { classify, compose, titleMask, sampleBand, clean, geometry, BAND, TITLE, OUT_W, OUT_H, VERSION };
+module.exports = { classify, compose, titleMask, bandDiff, sampleBand, clean, geometry, Tracker, Hud, writeNew, writeWhole, readSmallJson, mono,
+    BAND, TITLE, OUT_W, OUT_H, VERSION };
 if (require.main === module || bundled) main();
 
 })();
