@@ -103,9 +103,9 @@ test('показ: вспышка не показывается, предупре
         assert.deepStrictEqual(shown, [1]);
         tr.frame(T.title(), T.noisy(S.sampleBand()));                                 // the same, but for noise
         assert.deepStrictEqual(shown, [1]);
-        tr.frame(T.title(), T.idleBand()); await sleep(300); tr.same();
+        tr.frame(T.title(), T.idleBand()); await sleep(120); tr.same();
         assert.deepStrictEqual(shown, [1], 'ушло раньше времени');
-        await sleep(1400); tr.same();
+        await sleep(300); tr.same();
         assert.deepStrictEqual(shown, [1, 0]);
         assert.strictEqual(tr.stats.alerts, 1);
     } finally { process.stdout.write = logs; }
