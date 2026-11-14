@@ -8,7 +8,7 @@
       "ID7"
     ],
     "requires": {
-      "hudradar": "1.0.1"
+      "hudradar": "1.0.2"
     },
     "build": {
       "python": "kit/tools/build.py",
@@ -25,7 +25,7 @@
     {
       "id": "hudradar",
       "path": "service/prebuilt",
-      "version": "1.0.1",
+      "version": "1.0.2",
       "title": "Radar HUD service",
       "description": "Переносит предупреждения HUD Speed с дашборда CarPlay на проекцию. Управляется из приложения Radar HUD",
       "mguHmi": [

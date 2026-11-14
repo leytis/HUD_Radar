@@ -577,7 +577,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const VERSION = '1.0.1';
+const VERSION = '1.0.2';
 
 /* ---------- ресурсы: в собранном файле они внутри него, при запуске из исходников лежат рядом ---------- */
 /* global __BUNDLE */
@@ -606,7 +606,7 @@ const SCENE_W = 800, CENTRE_Y = 222;                // сцена проекци
 
 const HOLD_MS = 4000;          // плитка закрыта окном BMW: столько держим последнее предупреждение
 const STALE_MS = 150000;       // одно и то же предупреждение дольше этого не показываем
-const ON_MS = 200;             // предупреждение должно продержаться на плитке столько, прежде чем попадёт на стекло
+const ON_MS = 80;              // предупреждение должно продержаться на плитке столько, прежде чем попадёт на стекло
 const OFF_MS = 1500;           // и столько плитка должна быть пустой, прежде чем оно уйдёт
 const DEMO_MS = 8000;
 
@@ -783,7 +783,7 @@ class Hud {
     _make() {
         const g = this.geo;
         this.layer = this.cr.image({ target: 'hud', klass: 'overlay', x: g.x, y: g.y, w: g.w, h: g.h, iw: OUT_W, ih: OUT_H,
-            fps: 15, visible: false, opacity: g.opacity, sampling: 'bilinear' });
+            fps: 30, visible: false, opacity: g.opacity, sampling: 'bilinear' });
         this.visible = false;
     }
     /** The renderer refused the layer: drop it and make it again later (5 s, then once a minute). */
@@ -1040,7 +1040,7 @@ function main() {
     const capScript = resource('hs-cap.py');
     function startCapture() {
         if (!fs.existsSync(PYTHON)) { error = 'Не установлен Python (mgu-python) из MGU Store'; retryAt = mono() + 30000; return; }
-        const child = capture = spawn(PYTHON, ['-c', capScript, process.env.HR_PERIOD || '100'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        const child = capture = spawn(PYTHON, ['-c', capScript, process.env.HR_PERIOD || '50'], { stdio: ['ignore', 'pipe', 'pipe'] });
         const startedAt = mono();
         let buf = Buffer.alloc(0), sum = 0, n = 0;
         child.stdout.on('data', (d) => {
